@@ -11,6 +11,9 @@ const bytesOf = async (content) => (typeof content === "string" ? Buffer.from(co
 export function createLocalSandbox({ root, port }) {
   const at = (p) => resolve(root, p);
   const children = new Set();
+  // dsh 进程直接退出时 effect 清理不会跑，bridge 子进程会活下来占端口。
+  const reap = () => { for (const child of children) child.kill("SIGKILL"); };
+  process.once("exit", reap);
 
   const start = (options, wantsStdin) => {
     const child = spawnProcess(options.command, {
