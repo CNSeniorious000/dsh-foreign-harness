@@ -24,6 +24,11 @@ export function createLocalSandbox({ root, port }) {
     });
     children.add(child);
     child.on("close", () => children.delete(child));
+    // headless 跑完一轮后进程要能退出：bridge 是长跑子进程，别让它把事件循环焊住。
+    child.unref();
+    child.stdout?.unref?.();
+    child.stderr?.unref?.();
+    child.stdin?.unref?.();
     options.abortSignal?.addEventListener("abort", () => child.kill("SIGKILL"), { once: true });
     const handle = {
       pid: child.pid,
