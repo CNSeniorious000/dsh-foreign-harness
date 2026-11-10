@@ -1,0 +1,56 @@
+- id: agent-loop
+  disabled: true
+
+- id: llm-pi-ai
+  config:
+    providers:
+      mint-alpha:
+        api: anthropic-messages
+        baseURL: https://mint-alpha.macaron.xin
+        apiKeyEnv: MINT_ALPHA_API_KEY
+        models:
+          - id: deepseek-flash
+
+- id: agent-default-model
+  config:
+    provider: mint-alpha
+    model: deepseek-flash
+
+- insert:
+    - id: cc-agent-loop
+      name: dsh-cc-agent-loop
+
+    # 引擎选择：模式选择器里的另外两项。id 就是路由键（claude-step.js 里的 ENGINES）。
+    - id: preset-cc-claude
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: claude-code
+        name: Claude Code
+        description: 由本机 Claude Code 驱动；工具调用显示为 dsh 原生卡片。
+        order: 5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a coding agent powered by Claude Code.
+              complete: true
+              includeRuntimeContext: false
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+
+    - id: preset-cc-codex
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: codex
+        name: Codex
+        description: 由本机 Codex CLI 驱动；工具调用显示为 dsh 原生卡片。
+        order: 6
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a coding agent powered by Codex.
+              complete: true
+              includeRuntimeContext: false
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'

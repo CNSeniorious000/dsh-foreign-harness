@@ -836,7 +836,11 @@ var ReactLoopAgent = class {
 	async step(decision) {
 		/* v8 ignore next -- private callers establish the running phase before executing a step */
 		if (this.phase.kind !== "running") throw new Error(`agent "${this.id}": step outside running phase`);
-		if (claudeStepRunner !== null) return await claudeStepRunner(this, decision, { turn: this.phase.turn, step: this.phase.step, signal: this.phase.abort.signal });
+		if (claudeStepRunner !== null) {
+			// 返回 undefined 表示这一轮不归外部引擎管，继续走 stock 逻辑。
+			const intercepted = await claudeStepRunner(this, decision, { turn: this.phase.turn, step: this.phase.step, signal: this.phase.abort.signal });
+			if (intercepted !== undefined) return intercepted;
+		}
 		const { turn, step, abort: { signal } } = this.phase;
 		signal.throwIfAborted();
 		const { assembly } = decision;

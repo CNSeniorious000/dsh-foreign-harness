@@ -12,6 +12,20 @@
 - `src/harness.js` —— 每个 dsh 会话一个 Claude 会话（bridge 端口、`workDir: "."`、跨轮复用、dispose 回收）
 - `src/sandbox.js` —— 把本地目录实现成 `HarnessV1NetworkSandboxSession`（无隔离，接的就是 dsh 的 workspace）
 
+## 选择引擎
+
+dsh 没有「每个会话挑一个 agent loop」的选择器——loop 是 agent 注册表上的**单工厂槽**。能做的是把「模式（preset）」当引擎开关：preset 的 id 会记进会话日志，`claudeStep` 从日志里读它。
+
+`examples/web-engines.patch.yml` 插入了两个 preset，于是模式菜单里多出：
+
+- **标准模式** / PTC / 极简 / 创造 → 交回 stock loop（vendored 副本里的 stock 逻辑）
+- **Claude Code** → `@ai-sdk/harness-claude-code`
+- **Codex** → `@ai-sdk/harness-codex`
+
+headless 没有 preset 注册表，用 `DSH_CC_ENGINE=claude-code|codex` 选；不设就是 stock。
+
+Codex 的 model 取 `~/.codex/config.toml` 里的 `model`（adapter 默认的 `gpt-5.5` 不被 ChatGPT 账号接受），可用 `DSH_CC_CODEX_MODEL` 覆盖。
+
 ## 接线
 
 profile 里把 stock loop 换成这一行（`agent-loop` 是单工厂槽，不能并存）：
