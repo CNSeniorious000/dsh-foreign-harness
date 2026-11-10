@@ -68,7 +68,9 @@ export async function claudeStep(loop, decision, { turn, step, signal }) {
     onEvent: (part) => {
       if (part.type === "text-delta") pushText(part.text ?? part.textDelta ?? "");
       if (part.type === "tool-call") {
-        blocks.push({ type: "tool-call", id: part.toolCallId, name: part.toolName, arguments: JSON.stringify(part.input ?? {}) });
+        // Claude 的 Task 工具在 wire 上叫 Agent；dsh 的界面只把 `subagent*` 认成子代理委托。
+        const name = part.toolName === "Agent" ? "subagent" : part.toolName;
+        blocks.push({ type: "tool-call", id: part.toolCallId, name, arguments: JSON.stringify(part.input ?? {}) });
       }
       if ((part.type === "tool-result" || part.type === "tool-error") && part.providerExecuted) {
         const output = part.type === "tool-error" ? String(part.error?.message ?? part.error) : JSON.stringify(part.output, null, 2);

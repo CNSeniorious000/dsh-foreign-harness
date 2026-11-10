@@ -51,5 +51,6 @@ dsh --profile ccspike --patch ./patch.yml "看一下 note.txt"
 - 不给 `sandboxConfig.workDir: "."` 时，会话 cwd 会变成 `<workspace>/<harnessId>-<sessionId>`。
 - `assistant/message` 必须带可迭代的 `stream` 帧，否则整段历史投影失败（`stream is not iterable`），界面连正文都不显示。
 - 只写 `assistant/message` 的 `tool-call` 块不够：客户端的卡片从 `tool/call` 事件取名字和参数，`tool/result` 要用 `sourceEventSeqs` 指回那条 `tool/call`，否则卡片只剩裸 `callId`。
+- Claude 的 `Task` 工具在 wire 上叫 `Agent`；dsh 只把 `subagent` / `subagent_*` 认成子代理委托，所以翻译时改名为 `subagent`，界面才会显示「已协调子智能体」而不是普通工具卡。
 - `usage` 必须显式挑字段，AI SDK 的 usage 含 `undefined`，会被 `isJsonValue` 拒绝。
 - headless 一轮就结束：默认销毁 Claude 会话和 bridge，否则进程退不出去（web 里设 `DSH_CC_SESSION_KEEP=1` 保留）。
