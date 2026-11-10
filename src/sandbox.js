@@ -15,10 +15,16 @@ export function createLocalSandbox({ root, port }) {
   const reap = () => { for (const child of children) child.kill("SIGKILL"); };
   process.once("exit", reap);
 
+  // 引擎继承宿主 env（和终端里跑 claude 一致）。想让它用别的凭据时用 DSH_CC_STRIP_ANTHROPIC=1 剥掉网关变量。
+  const harnessEnv = () => {
+    if (process.env.DSH_CC_STRIP_ANTHROPIC !== "1") return process.env;
+    return Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ANTHROPIC_")));
+  };
+
   const start = (options, wantsStdin) => {
     const child = spawnProcess(options.command, {
       cwd: options.workingDirectory ? at(options.workingDirectory) : root,
-      env: { ...process.env, ...options.env },
+      env: { ...harnessEnv(), ...options.env },
       shell: true,
       stdio: [wantsStdin ? "pipe" : "ignore", "pipe", "pipe"],
     });
