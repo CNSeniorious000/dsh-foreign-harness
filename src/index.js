@@ -7,6 +7,7 @@ import z from "@deepseek-ai/schemastery";
 import { AgentLoop } from "@deepseek-ai/dsh-agent-loop";
 import { ENGINES } from "./harness.js";
 import { runEngineStep, disposeEngineSession } from "./engine-step.js";
+import { startArchiveSync } from "./archive-sync.js";
 
 const readField = (field) => (typeof field?.get === "function" ? field.get() : field);
 const envFlag = (name, fallback) => (process.env[name] !== undefined ? process.env[name] === "1" : fallback ?? false);
@@ -78,6 +79,8 @@ export class ForeignHarnessLoop extends AgentLoop {
 
   async [Service.init]() {
     await super[Service.init]();
+    // dsh ↔ Codex 归档状态双向同步（引擎会话的归档对齐）。
+    this.ctx.effect(() => startArchiveSync(this.ctx), "foreign-harness.archive-sync");
   }
 
   get foreignSettings() {
