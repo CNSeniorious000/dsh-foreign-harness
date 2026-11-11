@@ -87,4 +87,4 @@ DSH_CC_ENGINE=claude-code dsh --profile <p> --patch ./patch.yml "收到请回复
 
 - 图片/文件附件只投影成 dsh 的确定性 handle 文本（`textOnlyImageText` / `fileHandleText`），引擎拿不到字节。
 - 后台子智能体不会回报，界面上也还没有子智能体树。
-- 会话归档只与 Codex 双向同步（Claude Code 本地没有归档概念），且是增量驱动——插件启动之前就存在的分歧不会被追溯抹平。
+- 会话归档只与 Codex 双向同步；Claude Code 会话在引擎侧没有归档概念，归档状态就存在 dsh。同步是增量驱动——插件启动之前就存在的分歧不会被追溯抹平。

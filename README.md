@@ -87,4 +87,4 @@ DSH_CC_ENGINE=claude-code dsh --profile <p> --patch ./patch.yml "收到请回复
 
 - Image/file attachments are projected to dsh's deterministic handle text (`textOnlyImageText` / `fileHandleText`) — the engines never see the bytes.
 - Background subagents don't report back; there is no child agent tree in the UI yet.
-- Session archive syncs both ways with Codex only (Claude Code has no local archive concept), and it is change-driven from plugin startup — divergences that predate it stay put.
+- Session archive syncs both ways with Codex only; Claude Code sessions have no engine-side archive at all, so their archive state simply lives in dsh. Sync is change-driven from plugin startup — divergences that predate it stay put.
