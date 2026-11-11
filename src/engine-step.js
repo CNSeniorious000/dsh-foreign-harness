@@ -26,11 +26,16 @@ function promptOf(messages) {
     .join("\n\n");
 }
 
-/** 引擎会话接不回来时（resume state 缺失/过期）的兜底：把已落日志的对话拼成上下文前缀。 */
-function historyTextOf(session) {
+/** 引擎会话接不回来时（resume state 缺失/过期）的兜底：把已落日志的对话拼成上下文前缀。
+ * 只取人和引擎真正说过的话：dsh 的 runtime/time context 是给自家 loop 的（文件策略、审批提示、GUI 地址之类），进引擎只会污染判断。
+ * @param {object} session @param {Set<string>} excludeIds 本轮刚落的消息不算「此前」
+ */
+function historyTextOf(session, excludeIds) {
   const parts = [];
   for (const message of session.deriveMessages()) {
+    if (excludeIds.has(message.id)) continue;
     if (message.role !== "user" && message.role !== "assistant") continue;
+    if (message.source?.kind === "runtime-context" || message.source?.kind === "time-context") continue;
     const text = (message.content ?? []).filter((block) => block.type === "text" || block.type === "reasoning").map((block) => block.text).join("\n").trim();
     if (text !== "") parts.push(`${message.role === "user" ? "用户" : "你"}：${text}`);
   }
@@ -93,7 +98,7 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   const engineSession = await engineSessionOf(agent, engine, settings);
   const prompt = promptOf(decision.messages);
   // 引擎会话全新（接不回原对话）才摊历史兜底；能接回时上下文在引擎自己手里，不重复喂。
-  const context = engineSession.fresh ? historyTextOf(session) : "";
+  const context = engineSession.fresh ? historyTextOf(session, new Set(decision.messages.map((message) => message.id))) : "";
   const input = context === "" ? prompt : `${context}\n\n（以上是此前的对话记录。下面是用户的新消息。）\n\n${prompt}`;
   if (input === "") throw new Error(`${engine}: nothing to run — this turn has no user content`);
 
