@@ -9,9 +9,9 @@ kind: "package-reference"
 
 ## 概述
 
-`dsh-foreign-harness` 替换 stock 的 `dsh-agent-loop`，让每个 dsh step 由外来编码智能体驱动，而不是裸模型请求：dsh 负责会话、界面和事件；Claude Code / Codex（经 AI SDK harness 适配器）负责思考和动手。工具调用被翻译成 `tool/call` + `tool/result` 事件，于是 web 里用的是 dsh 自己的工具卡。
+`dsh-foreign-harness` 让外来编码智能体驱动 dsh 的回合：dsh 负责会话、界面和事件；Claude Code / Codex（经 AI SDK harness 适配器）负责思考和动手。工具调用被翻译成 `tool/call` + `tool/result` 事件，于是 web 里用的是 dsh 自己的工具卡。
 
-stock loop 以 vendored 副本保留（`vendor/agent-loop.js`，0.2.2-rc.1），只有两处改动：`setClaudeStep()` 和 `ReactLoopAgent.step()` 开头的分流点。模式（preset）不是我们这两个时返回 `undefined`，走未动过的 stock 逻辑。
+集成方式是 **替换 step，而不是替换 loop**：插件子类化 stock 的 `@deepseek-ai/dsh-agent-loop`（无 vendored 副本），把每个 agent 的 `step()` 实例方法换成按 preset 路由——引擎 preset 跑 harness 回合，其余原样走未动过的 stock step。inbox、turn/step 编排、事件、preset 插件全是上游原装，逐 step 路由让换模式、冷恢复、任意切换顺序都天然正确。
 
 ## 目录
 
@@ -23,7 +23,7 @@ stock loop 以 vendored 副本保留（`vendor/agent-loop.js`，0.2.2-rc.1），
 
 ## 使用
 
-dsh 没有「每个会话挑一个 agent loop」的选择器——loop 是单一工厂槽。引擎选择因此挂在模式（preset）选择器上：preset 的 id 记进会话日志，step 再读回来。
+引擎选择挂在模式（preset）选择器上：preset 的 id 记进会话日志，每个 step 再读回来。
 
 ```yaml
 # profile 的 cordis.patch.yml
@@ -58,15 +58,15 @@ dsh --profile <p> --patch ./patch.yml "看一下 note.txt"
 | config | env | 默认 | 含义 |
 | --- | --- | --- | --- |
 | `codexModel` | `DSH_CC_CODEX_MODEL` | `~/.codex/config.toml` 的 `model` | Codex 引擎的模型（adapter 默认的 `gpt-5.5` 不被 ChatGPT 账号接受） |
-| `keepSessions` | `DSH_CC_SESSION_KEEP=1` | `false` | 跨 step 保留 harness 会话（web 用）；headless 每轮回收，进程才能退出 |
 | `stripAnthropicEnv` | `DSH_CC_STRIP_ANTHROPIC=1` | `false` | 给引擎剥离 `ANTHROPIC_*` 环境变量（默认继承宿主 env，和终端里跑 `claude` 一致） |
 
 ## 实现结构
 
-- `src/index.js` —— 导出 `ForeignHarnessLoop`（stock `AgentLoop` 子类）并注册 step 分流点
-- `src/claude-step.js` —— 一个 step：读 preset → 只用用户的话拼 prompt → 跑 harness 一轮 → 落 `assistant/message`（带回放帧）+ `tool/call` + `tool/result`
-- `src/harness.js` —— 每个 dsh 会话一个 harness 会话（bridge 端口、`workDir: "."`、跨 step 复用、dispose 回收）
+- `src/index.js` —— `ForeignHarnessLoop`（stock `AgentLoop` 子类）：给每个创建/恢复的 agent 打上 step 引擎路由；引擎会话在 owner teardown 时经 `disposeEngineSession` 停掉
+- `src/engine-step.js` —— 一个引擎回合：用户消息 → harness 回合 → 实时 `agent/assistant-stream` 帧 → durable `assistant/message`（带紧凑 stream）+ `tool/call` + `tool/result`；引擎会话的 resume state 以 `plugin:dsh-foreign-harness/state` 记录持久化，对话可跨进程接续
+- `src/harness.js` —— 每个 dsh 会话一个 harness 会话（bridge 端口、`workDir: "."`、`detach`/`stop` resume state、dispose）
 - `src/sandbox.js` —— 把本地目录实现成 `HarnessV1NetworkSandboxSession`（无隔离，接的就是 dsh 的 workspace）
+- `src/stream-attempt.js` —— 实时 assistant 流的帧协议（start → chunk* → end，revision 单调），用 dsh-llm 的公开原语实现
 
 客户端投影的硬契约（违反任何一条渲染就坏）：
 
@@ -86,5 +86,4 @@ DSH_CC_ENGINE=claude-code dsh --profile <p> --patch ./patch.yml "收到请回复
 ## 已知限制
 
 - 图片/文件附件只投影成 dsh 的确定性 handle 文本（`textOnlyImageText` / `fileHandleText`），引擎拿不到字节。
-- 多轮历史每 step 摊平成一条 user 消息（只取 `source.kind === "user"` 的内容）。
 - 后台子智能体不会回报，界面上也还没有子智能体树。

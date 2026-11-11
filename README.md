@@ -9,9 +9,9 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-foreign-harness` replaces the stock `dsh-agent-loop` so that every dsh step is driven by a foreign coding agent instead of a raw model request: dsh owns sessions, UI and events; Claude Code / Codex (through the AI SDK harness adapters) own thinking and tool use. Tool calls are translated into `tool/call` + `tool/result` events, so the web UI renders them with dsh's own tool cards.
+`dsh-foreign-harness` lets foreign coding agents drive dsh turns: dsh owns sessions, UI and events; Claude Code / Codex (through the AI SDK harness adapters) own thinking and tool use. Tool calls are translated into `tool/call` + `tool/result` events, so the web UI renders them with dsh's own tool cards.
 
-The stock loop is vendored (`vendor/agent-loop.js`, 0.2.2-rc.1) with exactly two touches: `setClaudeStep()` and an intercept at the top of `ReactLoopAgent.step()`. Any preset that is not one of ours returns `undefined` and runs the untouched stock logic.
+The integration is a **step override, not a loop replacement**: the plugin subclasses the stock `@deepseek-ai/dsh-agent-loop` (no vendored copies) and swaps each agent's `step()` method for a per-step router — engine presets run a harness round, everything else falls through to the untouched stock step. Inbox, turn/step orchestration, events and preset plugins are all upstream's own code, and per-step routing makes mode switches, cold resumes and any switch order inherently correct.
 
 ## Table of Contents
 
@@ -23,7 +23,7 @@ The stock loop is vendored (`vendor/agent-loop.js`, 0.2.2-rc.1) with exactly two
 
 ## Use this package
 
-dsh has no per-session agent-loop selector — the loop is a single factory slot. Engine choice therefore rides on the mode (preset) selector: the preset id is recorded in the session log and the step reads it back.
+Engine choice rides on the mode (preset) selector: the preset id is recorded in the session log and the step reads it back per step.
 
 ```yaml
 # in the profile's cordis.patch.yml
@@ -58,15 +58,15 @@ Settings are the plugin row's `config`, exposed in dsh's settings form as volati
 | config | env | default | meaning |
 | --- | --- | --- | --- |
 | `codexModel` | `DSH_CC_CODEX_MODEL` | `~/.codex/config.toml` `model` | model for the Codex engine (the adapter default `gpt-5.5` is rejected by ChatGPT accounts) |
-| `keepSessions` | `DSH_CC_SESSION_KEEP=1` | `false` | keep the harness session across steps (web); headless disposes after every round so the process can exit |
 | `stripAnthropicEnv` | `DSH_CC_STRIP_ANTHROPIC=1` | `false` | strip `ANTHROPIC_*` variables from the engine's environment (default inherits the host env, same as running `claude` in a terminal) |
 
 ## Understand the implementation
 
-- `src/index.js` — exports `ForeignHarnessLoop` (stock `AgentLoop` subclass) and registers the step intercept
-- `src/claude-step.js` — one step: read the preset → build the prompt from user words only → run a harness round → settle `assistant/message` (with replay frames) + `tool/call` + `tool/result`
-- `src/harness.js` — one harness session per dsh session (bridge port, `workDir: "."`, reuse across steps, dispose)
+- `src/index.js` — `ForeignHarnessLoop` (stock `AgentLoop` subclass): patches each created/resumed agent's `step()` with the engine router; engine sessions stop through `disposeEngineSession` at owner teardown
+- `src/engine-step.js` — one engine round: user messages → harness round → live `agent/assistant-stream` frames → durable `assistant/message` (with compact stream) + `tool/call` + `tool/result`; engine sessions persist their resume state as `plugin:dsh-foreign-harness/state` records, so the conversation continues across processes
+- `src/harness.js` — one harness session per dsh session (bridge port, `workDir: "."`, `detach`/`stop` resume states, dispose)
 - `src/sandbox.js` — a local directory as `HarnessV1NetworkSandboxSession` (no isolation; wired to the dsh workspace)
+- `src/stream-attempt.js` — the live assistant stream frame protocol (start → chunk* → end with monotonic revisions) implemented on dsh-llm's public primitives
 
 Contracts the client projection requires (violating any of them breaks rendering):
 
@@ -86,5 +86,4 @@ DSH_CC_ENGINE=claude-code dsh --profile <p> --patch ./patch.yml "收到请回复
 ## Known Limitations
 
 - Image/file attachments are projected to dsh's deterministic handle text (`textOnlyImageText` / `fileHandleText`) — the engines never see the bytes.
-- Multi-turn history is flattened into one user message per step (only `source.kind === "user"` content).
 - Background subagents don't report back; there is no child agent tree in the UI yet.

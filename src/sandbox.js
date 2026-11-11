@@ -24,8 +24,8 @@ export function createLocalSandbox({ root, port, stripAnthropic = process.env.DS
   const reap = () => { for (const child of children) child.kill("SIGKILL"); children.clear(); };
   const baseEnv = stripAnthropic ? Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ANTHROPIC_"))) : process.env;
 
-  /** @param {{ command: string, workingDirectory?: string, env?: Record<string, string>, abortSignal?: AbortSignal }} options @param {boolean} wantsStdin */
-  const start = (options, wantsStdin) => {
+  /** @param {{ command: string, workingDirectory?: string, env?: Record<string, string>, abortSignal?: AbortSignal }} options @param {boolean} wantsStdin @param {boolean} detach 长跑子进程（bridge）才 unref——unref 过的 stdio 在 node 下不再吐数据，run() 这种要读完输出的不能碰 */
+  const start = (options, wantsStdin, detach) => {
     const child = spawnProcess(options.command, {
       cwd: options.workingDirectory ? at(options.workingDirectory) : root,
       env: { ...baseEnv, ...options.env },
@@ -35,11 +35,13 @@ export function createLocalSandbox({ root, port, stripAnthropic = process.env.DS
     children.add(child);
     survivors.add(child);
     child.on("close", () => { children.delete(child); survivors.delete(child); });
-    // headless 跑完一轮后进程要能退出：bridge 是长跑子进程，别让它把事件循环焊住。
-    child.unref();
-    child.stdout?.unref?.();
-    child.stderr?.unref?.();
-    child.stdin?.unref?.();
+    if (detach) {
+      // headless 跑完一轮后进程要能退出：bridge 是长跑子进程，别让它把事件循环焊住。
+      child.unref();
+      child.stdout?.unref?.();
+      child.stderr?.unref?.();
+      child.stdin?.unref?.();
+    }
     options.abortSignal?.addEventListener("abort", () => child.kill("SIGKILL"), { once: true });
     const handle = {
       pid: child.pid,
@@ -74,9 +76,9 @@ export function createLocalSandbox({ root, port, stripAnthropic = process.env.DS
         return entries.map((e) => ({ name: e.name, type: e.isFile() ? "file" : e.isDirectory() ? "directory" : e.isSymbolicLink() ? "symlink" : "other" }));
       } catch { return null; } },
     deleteFile: async ({ path }) => { try { await unlink(at(path)); return true; } catch { return false; } },
-    spawn: async (options) => start(options, options.stdin === true),
+    spawn: async (options) => start(options, options.stdin === true, true),
     run: async (options) => {
-      const child = start(options, false);
+      const child = start(options, false, false);
       const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const { exitCode } = await child.wait();
       return { exitCode, stdout, stderr };

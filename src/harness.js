@@ -33,17 +33,21 @@ export const ENGINES = new Set(["claude-code", "codex"]);
 const HARNESSES = { "claude-code": createClaudeCode, codex: createCodex };
 
 /**
- * harness 会话句柄：turn 跑一轮并把流事件回调出来，dispose 回收 bridge。
+ * harness 会话句柄：turn 跑一轮并把流事件回调出来；detach/stop 返回可持久化的 resume state（JSONValue），
+ * 下次 createHarnessSession({ sessionId, resumeFrom }) 跨进程接回；destroy 直接销毁。
  * @typedef {object} HarnessHandle
+ * @property {string} sessionId
  * @property {(prompt: string, options?: { signal?: AbortSignal, onEvent?: (part: import("ai").TextStreamPart<Record<string, import("ai").Tool>>) => void }) => Promise<{ text: string, usage: import("ai").LanguageModelUsage }>} turn
- * @property {() => Promise<void>} dispose
+ * @property {() => Promise<import("@ai-sdk/harness/agent").HarnessAgentResumeSessionState>} detach
+ * @property {() => Promise<import("@ai-sdk/harness/agent").HarnessAgentResumeSessionState>} stop
+ * @property {() => Promise<void>} destroy
  */
 
 /**
- * @param {{ engine: string, cwd: string, settings?: { codexModel?: string, stripAnthropicEnv?: boolean } }} options
+ * @param {{ engine: string, cwd: string, settings?: { codexModel?: string, stripAnthropicEnv?: boolean }, sessionId?: string, resumeFrom?: import("@ai-sdk/harness/agent").HarnessAgentResumeSessionState }} options
  * @returns {Promise<HarnessHandle>}
  */
-export async function createHarnessSession({ engine, cwd, settings }) {
+export async function createHarnessSession({ engine, cwd, settings, sessionId, resumeFrom }) {
   const port = await freePort();
   const sandbox = createLocalSandbox({ root: cwd, port, ...(settings?.stripAnthropicEnv === undefined ? {} : { stripAnthropic: settings.stripAnthropicEnv }) });
   const model = engine === "codex" ? settings?.codexModel ?? codexModel() : undefined;
@@ -53,13 +57,16 @@ export async function createHarnessSession({ engine, cwd, settings }) {
     sandboxConfig: { workDir: "." },
     ...(model === undefined ? {} : { model }),
   });
-  const session = await agent.createSession({ sandboxSession: sandbox });
+  const session = await agent.createSession({ sandboxSession: sandbox, ...(sessionId === undefined ? {} : { sessionId }), ...(resumeFrom === undefined ? {} : { resumeFrom }) });
   return {
+    sessionId: session.sessionId,
     async turn(prompt, { signal, onEvent } = {}) {
       const result = await agent.stream({ session, prompt, abortSignal: signal });
       for await (const part of result.stream) onEvent?.(part);
       return { text: (await result.text).trim(), usage: await result.usage };
     },
-    async dispose() { await session.destroy?.().catch(() => {}); await sandbox.destroy(); },
+    async detach() { const state = await session.detach(); await sandbox.destroy(); return state; },
+    async stop() { const state = await session.stop(); await sandbox.destroy(); return state; },
+    async destroy() { await session.destroy?.().catch(() => {}); await sandbox.destroy(); },
   };
 }
