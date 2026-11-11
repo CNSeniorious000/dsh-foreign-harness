@@ -25,7 +25,7 @@ export function engineOfSession(session) {
 }
 
 /** 把一个 stock agent 的 step() 换成引擎路由；handle.dispose 时顺带停引擎会话。 */
-function patchAgent(ownerCtx, handle, settings) {
+function patchAgent(serviceCtx, ownerCtx, handle, settings) {
   const agent = handle.agent;
   const stockStep = agent.step.bind(agent);
   agent.step = async function (decision) {
@@ -33,7 +33,7 @@ function patchAgent(ownerCtx, handle, settings) {
     if (engine === undefined) return stockStep(decision);
     const signal = this.phase.abort.signal;
     try {
-      return await runEngineStep(this, decision, { turn: this.phase.turn, step: this.phase.step, signal, engine, settings });
+      return await runEngineStep(this, decision, { turn: this.phase.turn, step: this.phase.step, signal, engine, settings, ctx: serviceCtx });
     } finally {
       await decision.toolSet?.dispose?.();
     }
@@ -91,11 +91,12 @@ export class ForeignHarnessLoop extends AgentLoop {
   }
 
   async createAgent(ownerCtx, options) {
-    return patchAgent(ownerCtx, await super.createAgent(ownerCtx, options), this.foreignSettings);
+    // serviceCtx 用插件自己的服务上下文：agent.ctx 是隔离 scope，credentials/configEditor 在上面取不到。
+    return patchAgent(this.ctx, ownerCtx, await super.createAgent(ownerCtx, options), this.foreignSettings);
   }
 
   async resume(ownerCtx, options) {
-    return patchAgent(ownerCtx, await super.resume(ownerCtx, options), this.foreignSettings);
+    return patchAgent(this.ctx, ownerCtx, await super.resume(ownerCtx, options), this.foreignSettings);
   }
 }
 

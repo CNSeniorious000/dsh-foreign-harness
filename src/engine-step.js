@@ -5,6 +5,7 @@ import { createAssistantMessage, createToolResultMessage, fileHandleText, textOn
 import { appendPluginRecord, pluginRecordOf } from "@deepseek-ai/dsh-session";
 import { createHarnessSession } from "./harness.js";
 import { EngineStreamAttempt } from "./stream-attempt.js";
+import { engineRoute } from "./route.js";
 
 /** 引擎会话的持久化记录：harness 的 resume state 交给 dsh 的 plugin record 通道（fork/resume 都携带）。 */
 const STATE_RECORD = "plugin:dsh-foreign-harness/state";
@@ -51,7 +52,7 @@ function lastStateOf(session) {
 }
 
 /** 每个 dsh 会话一个引擎会话；引擎切换走新 sessionId，互不干扰。 */
-async function engineSessionOf(agent, engine, settings) {
+async function engineSessionOf(agent, engine, settings, authEnv) {
   const cached = agent.foreignEngineSession;
   if (cached?.engine === engine) return cached;
   if (cached !== undefined) await cached.handle.destroy();
@@ -60,6 +61,7 @@ async function engineSessionOf(agent, engine, settings) {
     engine,
     cwd: agent.session.header?.cwd ?? process.cwd(),
     settings,
+    ...(authEnv === undefined ? {} : { authEnv }),
     sessionId: state?.sessionId ?? `${agent.session.id}:${engine}`,
     ...(state?.resumeFrom === undefined ? {} : { resumeFrom: state.resumeFrom }),
   });
@@ -89,13 +91,14 @@ const finishKindOf = (reason) => {
  * 失败/中断先落可见产出再抛。decision.messages 会像 stock 一样落成 user/message。
  * @param {object} agent stock machine（有 session/model/dispatch/phase）
  * @param {{ messages: readonly object[], toolSet?: { dispose?: () => void } }} decision
- * @param {{ turn: number, step: number, signal: AbortSignal, engine: string, settings: object }} context
+ * @param {{ turn: number, step: number, signal: AbortSignal, engine: string, settings: object, ctx: object }} context
  */
-export async function runEngineStep(agent, decision, { turn, step, signal, engine, settings }) {
+export async function runEngineStep(agent, decision, { turn, step, signal, engine, settings, ctx }) {
   const session = agent.session;
   for (const message of decision.messages) session.append("user/message", message, { surfaceOp: "append" });
 
-  const engineSession = await engineSessionOf(agent, engine, settings);
+  const route = await engineRoute(ctx, agent, engine, settings);
+  const engineSession = await engineSessionOf(agent, engine, settings, route.authEnv);
   const prompt = promptOf(decision.messages);
   // 引擎会话全新（接不回原对话）才摊历史兜底；能接回时上下文在引擎自己手里，不重复喂。
   const context = engineSession.fresh ? historyTextOf(session, new Set(decision.messages.map((message) => message.id))) : "";
@@ -215,7 +218,7 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
 
   try {
     attempt.start();
-    await engineSession.handle.turn(input, { signal, onEvent: translate });
+    await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
   } catch (error) {
     // 中断/失败也把可见产出落盘（stock 同款 interrupted），否则界面上这轮凭空消失。
     const content = signal.aborted ? attempt.interruptedBlocks() : [];

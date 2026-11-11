@@ -37,46 +37,35 @@ const HARNESSES = { "claude-code": createClaudeCode, codex: createCodex };
  * 下次 createHarnessSession({ sessionId, resumeFrom }) 跨进程接回；destroy 直接销毁。
  * @typedef {object} HarnessHandle
  * @property {string} sessionId
- * @property {(prompt: string, options?: { signal?: AbortSignal, onEvent?: (part: import("ai").TextStreamPart<Record<string, import("ai").Tool>>) => void }) => Promise<{ text: string, usage: import("ai").LanguageModelUsage }>} turn
+ * @property {(prompt: string, options?: { signal?: AbortSignal, model?: string, onEvent?: (part: import("ai").TextStreamPart<Record<string, import("ai").Tool>>) => void }) => Promise<{ text: string, usage: import("ai").LanguageModelUsage }>} turn
  * @property {() => Promise<import("@ai-sdk/harness/agent").HarnessAgentResumeSessionState>} detach
  * @property {() => Promise<import("@ai-sdk/harness/agent").HarnessAgentResumeSessionState>} stop
  * @property {() => Promise<void>} destroy
  */
 
-/** 认证环境 = 宿主 ANTHROPIC_* + 设置项覆盖；显式配置过就整表交给 adapter（auth 会替换发现用的环境）。 */
-function authEnvOf(settings) {
-  const env = {};
-  for (const [key, value] of Object.entries(process.env)) if (key.startsWith("ANTHROPIC_") && value) env[key] = value;
-  if (settings?.anthropicApiKey) env.ANTHROPIC_AUTH_TOKEN = settings.anthropicApiKey;
-  if (settings?.anthropicBaseUrl) env.ANTHROPIC_BASE_URL = settings.anthropicBaseUrl;
-  if (settings?.anthropicModel) env.ANTHROPIC_MODEL = settings.anthropicModel;
-  return Object.keys(env).length > 0 ? env : undefined;
-}
-
 /**
- * @param {{ engine: string, cwd: string, settings?: { codexModel?: string, stripAnthropicEnv?: boolean, anthropicApiKey?: string, anthropicBaseUrl?: string, anthropicModel?: string }, sessionId?: string, resumeFrom?: import("@ai-sdk/harness/agent").HarnessAgentResumeSessionState }} options
+ * @param {{ engine: string, cwd: string, settings?: object, sessionId?: string, resumeFrom?: import("@ai-sdk/harness/agent").HarnessAgentResumeSessionState, model?: string, authEnv?: Record<string, string> }} options model/authEnv 由 route.js 从 dsh 的模型选择与 provider 配置解析
  * @returns {Promise<HarnessHandle>}
  */
-export async function createHarnessSession({ engine, cwd, settings, sessionId, resumeFrom }) {
+export async function createHarnessSession({ engine, cwd, settings, sessionId, resumeFrom, model, authEnv }) {
   const port = await freePort();
-  const model = engine === "codex" ? settings?.codexModel ?? codexModel() : undefined;
-  const authEnv = authEnvOf(settings);
+  const resolvedModel = model ?? (engine === "codex" ? codexModel() : undefined);
   // 认证/模型变量要进 sandbox 基础 env：auth 只喂 adapter 的认证发现，CLI 的模型和网关地址从进程 env 取。
   const sandbox = createLocalSandbox({ root: cwd, port, ...(settings?.stripAnthropicEnv === undefined ? {} : { stripAnthropic: settings.stripAnthropicEnv }), ...(authEnv === undefined ? {} : { env: authEnv }) });
   const adapterOptions = engine === "codex"
-    ? (model === undefined ? {} : { codexConfig: { model } })
+    ? (resolvedModel === undefined ? {} : { codexConfig: { model: resolvedModel } })
     : (authEnv === undefined ? {} : { auth: authEnv });
   const agent = new HarnessAgent({
     id: engine,
     harness: HARNESSES[engine](adapterOptions),
     sandboxConfig: { workDir: "." },
-    ...(model === undefined ? {} : { model }),
+    ...(resolvedModel === undefined ? {} : { model: resolvedModel }),
   });
   const session = await agent.createSession({ sandboxSession: sandbox, ...(sessionId === undefined ? {} : { sessionId }), ...(resumeFrom === undefined ? {} : { resumeFrom }) });
   return {
     sessionId: session.sessionId,
-    async turn(prompt, { signal, onEvent } = {}) {
-      const result = await agent.stream({ session, prompt, abortSignal: signal });
+    async turn(prompt, { signal, onEvent, model: turnModel } = {}) {
+      const result = await agent.stream({ session, prompt, abortSignal: signal, ...(turnModel === undefined ? {} : { model: turnModel }) });
       for await (const part of result.stream) onEvent?.(part);
       return { text: (await result.text).trim(), usage: await result.usage };
     },
