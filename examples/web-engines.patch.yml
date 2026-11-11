@@ -21,6 +21,7 @@
       name: dsh-cc-agent-loop
 
     # 引擎选择：模式选择器里的另外两项。id 就是路由键（claude-step.js 里的 ENGINES）。
+    # 这两个 preset 只是标签：引擎用自己的系统提示词，dsh 不做任何注入。
     - id: preset-cc-claude
       name: '@deepseek-ai/dsh-agent-preset'
       config:
@@ -28,15 +29,7 @@
         name: Claude Code
         description: 由本机 Claude Code 驱动；工具调用显示为 dsh 原生卡片。
         order: 5
-        plugins:
-          - id: persona
-            name: '@deepseek-ai/dsh-persona'
-            config:
-              prefix: You are a coding agent powered by Claude Code.
-              complete: true
-              includeRuntimeContext: false
-          - id: time-context
-            name: '@deepseek-ai/dsh-time-context'
+        plugins: []
 
     - id: preset-cc-codex
       name: '@deepseek-ai/dsh-agent-preset'
@@ -45,12 +38,4 @@
         name: Codex
         description: 由本机 Codex CLI 驱动；工具调用显示为 dsh 原生卡片。
         order: 6
-        plugins:
-          - id: persona
-            name: '@deepseek-ai/dsh-persona'
-            config:
-              prefix: You are a coding agent powered by Codex.
-              complete: true
-              includeRuntimeContext: false
-          - id: time-context
-            name: '@deepseek-ai/dsh-time-context'
+        plugins: []

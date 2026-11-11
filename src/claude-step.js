@@ -50,7 +50,8 @@ export async function claudeStep(loop, decision, { turn, step, signal }) {
 
   for (const message of decision.messages) session.append("user/message", message, { surfaceOp: "append" });
 
-  const prompt = decision.messages.map(textOf).filter(Boolean).join("\n\n");
+  // 只给引擎用户自己说的话：runtime/time context 是 dsh 给自家 loop 用的，喂给 Claude/Codex 只会污染判断。
+  const prompt = decision.messages.filter((message) => message.source?.kind === "user").map(textOf).filter(Boolean).join("\n\n");
   console.error("[cc-loop] step", { engine, turn, step, prompt: prompt.slice(0, 120) });
   const claude = await sessionFor(loop, engine);
   console.error("[cc-loop] claude session ready");
