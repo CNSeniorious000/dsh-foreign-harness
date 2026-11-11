@@ -49,5 +49,7 @@ export async function engineRoute(ctx, agent, engine, settings) {
   const model = engine === "codex"
     ? settings.codexModel ?? undefined
     : settings.anthropicModel ?? selection?.model;
-  return { model, authEnv: Object.keys(env).length > 0 ? env : undefined };
+  // 会话绑定的 LLM 配置快照（无秘密：凭据只存引用名，值每次现解析）——dsh 侧唯一留存的轻量元数据。
+  const llm = defined({ provider: selection?.provider, model, baseURL: profile?.baseURL, apiKeyEnv: profile?.apiKeyEnv });
+  return { model, llm, authEnv: Object.keys(env).length > 0 ? env : undefined };
 }

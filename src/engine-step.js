@@ -6,6 +6,7 @@ import { appendPluginRecord, pluginRecordOf } from "@deepseek-ai/dsh-session";
 import { createHarnessSession } from "./harness.js";
 import { EngineStreamAttempt } from "./stream-attempt.js";
 import { engineRoute } from "./route.js";
+import { engineCliId } from "./archive-sync.js";
 
 /** 引擎会话的持久化记录：harness 的 resume state 交给 dsh 的 plugin record 通道（fork/resume 都携带）。 */
 const STATE_RECORD = "plugin:dsh-foreign-harness/state";
@@ -65,17 +66,33 @@ async function engineSessionOf(agent, engine, settings, authEnv) {
     sessionId: state?.sessionId ?? `${agent.session.id}:${engine}`,
     ...(state?.resumeFrom === undefined ? {} : { resumeFrom: state.resumeFrom }),
   });
-  agent.foreignEngineSession = { engine, handle, fresh: state === undefined };
+  agent.foreignEngineSession = { engine, handle, fresh: state === undefined, llm: state?.llm };
   return agent.foreignEngineSession;
 }
 
-/** teardown 时停掉引擎会话并把 resume state 落进会话日志，下次（哪怕跨进程）接回原对话。 */
+/**
+ * 引擎会话一有身份就落轻量元数据（SSOT：dsh 只存引擎归属、当时绑定的 LLM 配置、续聊用的引擎会话 id；
+ * bridge 坐标/令牌等引擎自身状态留在引擎自己的存储里）。每回合都落——teardown 的 effect 清理在
+ * 一次性进程里根本不会跑，靠 dispose 落盘会静默丢记录。写完显式 flush（写缓冲只在请求边界 drain）。
+ */
+async function rememberEngineState(ctx, agent, engine, engineSession) {
+  const cliId = await engineCliId(engineSession.handle.sessionId);
+  if (cliId === undefined) return;
+  appendPluginRecord(agent.session, STATE_RECORD, {
+    engine,
+    sessionId: engineSession.handle.sessionId,
+    ...(engineSession.llm === undefined ? {} : { llm: engineSession.llm }),
+    resumeFrom: { type: "resume-session", harnessId: engine, specificationVersion: "harness-v1", data: engine === "codex" ? { threadId: cliId } : { claudeSessionId: cliId } },
+  });
+  await ctx.get("sessions")?.flush?.(agent.session)?.catch?.(() => {});
+}
+
+/** teardown 时停掉引擎会话（记录已在每回合落过；resume state 的事实源在引擎自己的存储里）。 */
 export async function disposeEngineSession(agent) {
   const cached = agent.foreignEngineSession;
   agent.foreignEngineSession = undefined;
   if (cached === undefined) return;
-  const resumeFrom = await cached.handle.stop();
-  appendPluginRecord(agent.session, STATE_RECORD, { sessionId: cached.handle.sessionId, resumeFrom });
+  await cached.handle.stop();
 }
 
 const finishKindOf = (reason) => {
@@ -99,6 +116,7 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
 
   const route = await engineRoute(ctx, agent, engine, settings);
   const engineSession = await engineSessionOf(agent, engine, settings, route.authEnv);
+  engineSession.llm = route.llm;
   const prompt = promptOf(decision.messages);
   // 引擎会话全新（接不回原对话）才摊历史兜底；能接回时上下文在引擎自己手里，不重复喂。
   const context = engineSession.fresh ? historyTextOf(session, new Set(decision.messages.map((message) => message.id))) : "";
@@ -219,7 +237,9 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   try {
     attempt.start();
     await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
+    await rememberEngineState(ctx, agent, engine, engineSession);
   } catch (error) {
+    await rememberEngineState(ctx, agent, engine, engineSession);
     // 中断/失败也把可见产出落盘（stock 同款 interrupted），否则界面上这轮凭空消失。
     const content = signal.aborted ? attempt.interruptedBlocks() : [];
     if (content.length > 0) {

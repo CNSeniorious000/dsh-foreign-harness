@@ -68,6 +68,16 @@ async function archivedThreadIds() {
   return ids;
 }
 
+/** 引擎侧会话 id，从引擎自己的事件日志读：codex 是 bridge-thread 事件的 threadId（取最后一次，重启过就换线程），
+ * claude-code 是 finish 事件 harnessMetadata 里的 sessionId（流部件会把它规范化剥掉，只有日志里有）。 */
+export async function engineCliId(harnessSessionId) {
+  const head = await readFile(join(RUNS_DIR, encodeURIComponent(harnessSessionId), "bridge", "event-log.ndjson"), "utf8").catch(() => undefined);
+  if (head === undefined) return undefined;
+  let threadId;
+  for (const match of head.matchAll(/"type":"bridge-thread","threadId":"([^"]+)"/g)) threadId = match[1];
+  return threadId ?? head.match(/"harnessMetadata":\{"claude-code":\{[^{}]*"sessionId":"([^"]+)"/)?.[1];
+}
+
 /**
  * 启动归档同步：引擎事实先投影进 dsh（启动即对齐），之后全靠事件——
  * rollout 文件搬家（Codex 侧）或 workspace 归档集变化（dsh 侧）各推对侧。
@@ -75,7 +85,9 @@ async function archivedThreadIds() {
  * @returns {() => void} 停止函数（挂在 ctx.effect 上）
  */
 export function startArchiveSync(ctx) {
-  if (ctx.workspaceRegistry === undefined) return () => {};
+  // cordis 的服务属性访问要求 static inject 声明；ctx.get 是免声明通道（route.js 同款）。
+  const registry = ctx.get("workspaceRegistry");
+  if (registry === undefined) return () => {};
   const cache = new Map();
   /** @type {Map<string, { dsh: boolean | undefined, codex: boolean | undefined }>} threadId → 两侧上次值 */
   const prev = new Map();
@@ -86,15 +98,15 @@ export function startArchiveSync(ctx) {
     const dshId = (await codexThreadMap(cache)).get(threadId);
     if (dshId === undefined) return;
     const codex = archivedIds.has(threadId);
-    const dsh = ctx.workspaceRegistry.archivedSessionIds.some((id) => String(id) === dshId);
+    const dsh = registry.archivedSessionIds.some((id) => String(id) === dshId);
     const last = prev.get(threadId) ?? {};
     const plan = syncPlan(last.dsh, last.codex, dsh, codex);
     // 推送成功就乐观更新那一侧：否则自己写入的回声会被当成「对方也动了」而双双跳过。
     let wroteDsh = false;
     let wroteCodex = false;
     if (plan === "archive-codex" || plan === "unarchive-codex") wroteCodex = await exec("codex", [plan === "archive-codex" ? "archive" : "unarchive", threadId]);
-    if (plan === "archive-dsh") wroteDsh = await ctx.workspaceRegistry.archiveSession(dshId, { stopActivity: true }).then(() => true, () => false);
-    if (plan === "unarchive-dsh") wroteDsh = await ctx.workspaceRegistry.unarchiveSession(dshId).then(() => true, () => false);
+    if (plan === "archive-dsh") wroteDsh = await registry.archiveSession(dshId, { stopActivity: true }).then(() => true, () => false);
+    if (plan === "unarchive-dsh") wroteDsh = await registry.unarchiveSession(dshId).then(() => true, () => false);
     prev.set(threadId, { dsh: wroteDsh ? !dsh : dsh, codex: wroteCodex ? !codex : codex });
   };
 
@@ -128,7 +140,7 @@ export function startArchiveSync(ctx) {
   void (async () => {
     archivedIds = await archivedThreadIds();
     for (const [threadId, dshId] of await codexThreadMap(cache)) {
-      const dsh = ctx.workspaceRegistry.archivedSessionIds.some((id) => String(id) === dshId);
+      const dsh = registry.archivedSessionIds.some((id) => String(id) === dshId);
       prev.set(threadId, { dsh, codex: archivedIds.has(threadId) });
     }
   })();
