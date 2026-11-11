@@ -15,14 +15,15 @@ const survivors = new Set();
 process.once("exit", () => { for (const child of survivors) child.kill("SIGKILL"); });
 
 /**
- * @param {{ root: string, port: number, stripAnthropic?: boolean }} options stripAnthropic：给引擎剥离 ANTHROPIC_* 网关变量（默认继承宿主 env，和终端里跑 claude 一致）
+ * @param {{ root: string, port: number, stripAnthropic?: boolean, env?: Record<string, string> }} options stripAnthropic：给引擎剥离 ANTHROPIC_* 网关变量（默认继承宿主 env，和终端里跑 claude 一致）；env 合进每个子进程的基础环境（认证/模型变量要能到 CLI 手里）
  * @returns {import("@ai-sdk/harness").HarnessV1NetworkSandboxSession}
  */
-export function createLocalSandbox({ root, port, stripAnthropic = process.env.DSH_CC_STRIP_ANTHROPIC === "1" }) {
+export function createLocalSandbox({ root, port, stripAnthropic = process.env.DSH_CC_STRIP_ANTHROPIC === "1", env: extraEnv }) {
   const at = (p) => resolve(root, p);
   const children = new Set();
   const reap = () => { for (const child of children) child.kill("SIGKILL"); children.clear(); };
-  const baseEnv = stripAnthropic ? Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ANTHROPIC_"))) : process.env;
+  const host = stripAnthropic ? Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ANTHROPIC_"))) : process.env;
+  const baseEnv = extraEnv === undefined ? host : { ...host, ...extraEnv };
 
   /** @param {{ command: string, workingDirectory?: string, env?: Record<string, string>, abortSignal?: AbortSignal }} options @param {boolean} wantsStdin @param {boolean} detach 长跑子进程（bridge）才 unref——unref 过的 stdio 在 node 下不再吐数据，run() 这种要读完输出的不能碰 */
   const start = (options, wantsStdin, detach) => {
@@ -34,7 +35,8 @@ export function createLocalSandbox({ root, port, stripAnthropic = process.env.DS
     });
     children.add(child);
     survivors.add(child);
-    child.on("close", () => { children.delete(child); survivors.delete(child); });
+    // 记账和 wait 都等 exit：unref 过的 stdio 永远不 EOF，close 事件不会来。
+    child.on("exit", () => { children.delete(child); survivors.delete(child); });
     if (detach) {
       // headless 跑完一轮后进程要能退出：bridge 是长跑子进程，别让它把事件循环焊住。
       child.unref();
@@ -47,7 +49,12 @@ export function createLocalSandbox({ root, port, stripAnthropic = process.env.DS
       pid: child.pid,
       stdout: Readable.toWeb(child.stdout),
       stderr: Readable.toWeb(child.stderr),
-      wait: () => new Promise((ok, fail) => { child.on("close", (code) => ok({ exitCode: code ?? 0 })); child.on("error", fail); }),
+      wait: () => new Promise((ok, fail) => {
+        // exit 事件而非 close：unref 过的 stdio 永远不 EOF。已退出要立即返回，晚注册的监听者收不到历史事件。
+        if (child.exitCode !== null || child.signalCode !== null) return ok({ exitCode: child.exitCode ?? 0 });
+        child.on("exit", (code) => ok({ exitCode: code ?? 0 }));
+        child.on("error", fail);
+      }),
       kill: async () => { child.kill("SIGKILL"); },
     };
     if (wantsStdin) handle.stdin = Writable.toWeb(child.stdin);

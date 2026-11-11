@@ -64,6 +64,10 @@ export class ForeignHarnessLoop extends AgentLoop {
     })).default([]),
     codexModel: z.string().volatile(),
     stripAnthropicEnv: z.boolean().default(false).volatile(),
+    // 引擎认证：显式配置后经 harness 的 auth 注入，不依赖启动 dsh 的 shell 环境（CLI 会退回过期 OAuth 刷新报 400）。
+    anthropicApiKey: z.string().role("secret").volatile(),
+    anthropicBaseUrl: z.string().volatile(),
+    anthropicModel: z.string().volatile(),
   });
 
   constructor(ctx, config) {
@@ -80,6 +84,9 @@ export class ForeignHarnessLoop extends AgentLoop {
     return {
       codexModel: process.env.DSH_CC_CODEX_MODEL ?? readField(this.foreign.codexModel),
       stripAnthropicEnv: envFlag("DSH_CC_STRIP_ANTHROPIC", readField(this.foreign.stripAnthropicEnv)),
+      anthropicApiKey: readField(this.foreign.anthropicApiKey),
+      anthropicBaseUrl: readField(this.foreign.anthropicBaseUrl),
+      anthropicModel: readField(this.foreign.anthropicModel),
     };
   }
 

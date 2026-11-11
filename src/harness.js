@@ -43,17 +43,32 @@ const HARNESSES = { "claude-code": createClaudeCode, codex: createCodex };
  * @property {() => Promise<void>} destroy
  */
 
+/** 认证环境 = 宿主 ANTHROPIC_* + 设置项覆盖；显式配置过就整表交给 adapter（auth 会替换发现用的环境）。 */
+function authEnvOf(settings) {
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) if (key.startsWith("ANTHROPIC_") && value) env[key] = value;
+  if (settings?.anthropicApiKey) env.ANTHROPIC_AUTH_TOKEN = settings.anthropicApiKey;
+  if (settings?.anthropicBaseUrl) env.ANTHROPIC_BASE_URL = settings.anthropicBaseUrl;
+  if (settings?.anthropicModel) env.ANTHROPIC_MODEL = settings.anthropicModel;
+  return Object.keys(env).length > 0 ? env : undefined;
+}
+
 /**
- * @param {{ engine: string, cwd: string, settings?: { codexModel?: string, stripAnthropicEnv?: boolean }, sessionId?: string, resumeFrom?: import("@ai-sdk/harness/agent").HarnessAgentResumeSessionState }} options
+ * @param {{ engine: string, cwd: string, settings?: { codexModel?: string, stripAnthropicEnv?: boolean, anthropicApiKey?: string, anthropicBaseUrl?: string, anthropicModel?: string }, sessionId?: string, resumeFrom?: import("@ai-sdk/harness/agent").HarnessAgentResumeSessionState }} options
  * @returns {Promise<HarnessHandle>}
  */
 export async function createHarnessSession({ engine, cwd, settings, sessionId, resumeFrom }) {
   const port = await freePort();
-  const sandbox = createLocalSandbox({ root: cwd, port, ...(settings?.stripAnthropicEnv === undefined ? {} : { stripAnthropic: settings.stripAnthropicEnv }) });
   const model = engine === "codex" ? settings?.codexModel ?? codexModel() : undefined;
+  const authEnv = authEnvOf(settings);
+  // 认证/模型变量要进 sandbox 基础 env：auth 只喂 adapter 的认证发现，CLI 的模型和网关地址从进程 env 取。
+  const sandbox = createLocalSandbox({ root: cwd, port, ...(settings?.stripAnthropicEnv === undefined ? {} : { stripAnthropic: settings.stripAnthropicEnv }), ...(authEnv === undefined ? {} : { env: authEnv }) });
+  const adapterOptions = engine === "codex"
+    ? (model === undefined ? {} : { codexConfig: { model } })
+    : (authEnv === undefined ? {} : { auth: authEnv });
   const agent = new HarnessAgent({
     id: engine,
-    harness: HARNESSES[engine](model === undefined ? {} : { codexConfig: { model } }),
+    harness: HARNESSES[engine](adapterOptions),
     sandboxConfig: { workDir: "." },
     ...(model === undefined ? {} : { model }),
   });
