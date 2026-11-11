@@ -6,19 +6,25 @@ import { Readable, Writable } from "node:stream";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
+/** @param {string | Uint8Array | Blob} content @returns {Promise<Buffer>} */
 const bytesOf = async (content) => (typeof content === "string" ? Buffer.from(content) : content instanceof Uint8Array ? Buffer.from(content) : Buffer.from(await new Response(content).arrayBuffer()));
 
-// 所有 sandbox 共享一个子进程表和一个退出钩子：dsh 直接退出时 effect 清理不跑，bridge 会活下来占端口。
-const children = new Set();
-process.once("exit", () => { for (const child of children) child.kill("SIGKILL"); });
-const reap = () => { for (const child of children) child.kill("SIGKILL"); children.clear(); };
+// 全局表只服务进程退出钩子：dsh 直接退出时 effect 清理不跑，bridge 会活下来占端口。dsh 宿主接了 SIGTERM/SIGINT 并走
+// 优雅退出（exit 钩子会跑），所以这里不用再抢信号。destroy() 只杀自己会话的子进程——并发会话各有 bridge，全局收割会误杀别人的回合。
+const survivors = new Set();
+process.once("exit", () => { for (const child of survivors) child.kill("SIGKILL"); });
 
-// 引擎继承宿主 env（和终端里跑 claude 一致）。想让它用别的凭据时用 DSH_CC_STRIP_ANTHROPIC=1 剥掉网关变量。
-const baseEnv = process.env.DSH_CC_STRIP_ANTHROPIC === "1" ? Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ANTHROPIC_"))) : process.env;
-
-export function createLocalSandbox({ root, port }) {
+/**
+ * @param {{ root: string, port: number, stripAnthropic?: boolean }} options stripAnthropic：给引擎剥离 ANTHROPIC_* 网关变量（默认继承宿主 env，和终端里跑 claude 一致）
+ * @returns {import("@ai-sdk/harness").HarnessV1NetworkSandboxSession}
+ */
+export function createLocalSandbox({ root, port, stripAnthropic = process.env.DSH_CC_STRIP_ANTHROPIC === "1" }) {
   const at = (p) => resolve(root, p);
+  const children = new Set();
+  const reap = () => { for (const child of children) child.kill("SIGKILL"); children.clear(); };
+  const baseEnv = stripAnthropic ? Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ANTHROPIC_"))) : process.env;
 
+  /** @param {{ command: string, workingDirectory?: string, env?: Record<string, string>, abortSignal?: AbortSignal }} options @param {boolean} wantsStdin */
   const start = (options, wantsStdin) => {
     const child = spawnProcess(options.command, {
       cwd: options.workingDirectory ? at(options.workingDirectory) : root,
@@ -27,7 +33,8 @@ export function createLocalSandbox({ root, port }) {
       stdio: [wantsStdin ? "pipe" : "ignore", "pipe", "pipe"],
     });
     children.add(child);
-    child.on("close", () => children.delete(child));
+    survivors.add(child);
+    child.on("close", () => { children.delete(child); survivors.delete(child); });
     // headless 跑完一轮后进程要能退出：bridge 是长跑子进程，别让它把事件循环焊住。
     child.unref();
     child.stdout?.unref?.();
@@ -45,6 +52,7 @@ export function createLocalSandbox({ root, port }) {
     return handle;
   };
 
+  /** @param {{ path: string, content: string | Uint8Array | Blob }} file */
   const write = async ({ path, content }) => { await mkdir(dirname(at(path)), { recursive: true }); await writeFileToDisk(at(path), await bytesOf(content)); };
 
   const restricted = {
@@ -55,8 +63,7 @@ export function createLocalSandbox({ root, port }) {
       try {
         const lines = (await readFile(at(path), encoding)).split("\n");
         return lines.slice(startLine - 1, endLine ?? lines.length).join("\n");
-      } catch { return null; }
-    },
+      } catch { return null; } },
     writeFile: write,
     writeBinaryFile: write,
     writeTextFile: async ({ path, content, encoding = "utf-8" }) => { await mkdir(dirname(at(path)), { recursive: true }); await writeFileToDisk(at(path), content, encoding); },
@@ -65,8 +72,7 @@ export function createLocalSandbox({ root, port }) {
       try {
         const entries = await readdir(at(path), { withFileTypes: true });
         return entries.map((e) => ({ name: e.name, type: e.isFile() ? "file" : e.isDirectory() ? "directory" : e.isSymbolicLink() ? "symlink" : "other" }));
-      } catch { return null; }
-    },
+      } catch { return null; } },
     deleteFile: async ({ path }) => { try { await unlink(at(path)); return true; } catch { return false; } },
     spawn: async (options) => start(options, options.stdin === true),
     run: async (options) => {

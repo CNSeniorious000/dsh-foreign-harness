@@ -1,4 +1,4 @@
-// 一个 workspace 对应一个 harness 会话（Claude Code 或 Codex）：分配 bridge 端口、建 agent/session、跨轮复用。
+// 每个 dsh 会话一个 AI SDK Harness 会话（Claude Code / Codex CLI）：bridge 端口、工作目录、跨轮复用、dispose 回收。
 import { createServer } from "node:net";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -8,18 +8,23 @@ import { createClaudeCode } from "@ai-sdk/harness-claude-code";
 import { createCodex } from "@ai-sdk/harness-codex";
 import { createLocalSandbox } from "./sandbox.js";
 
-const freePort = () => new Promise((ok, fail) => {
+/** @returns {Promise<number>} */
+const freePort = () => new Promise((ok) => {
   const server = createServer();
-  server.once("error", fail);
-  server.listen(0, "127.0.0.1", () => { const { port } = server.address(); server.close(() => ok(port)); });
+  server.listen(0, "127.0.0.1", () => {
+    const port = server.address().port;
+    server.close(() => ok(port));
+  });
 });
 
-// adapter 默认写死 gpt-5.5，ChatGPT 账号不认；沿用本机 codex 自己配的 model。
+/** @type {string | null | undefined} */
 let cachedCodexModel;
+/** Codex 的 model 取 ~/.codex/config.toml（adapter 默认的 gpt-5.5 不被 ChatGPT 账号接受）。 @returns {string | undefined} */
 function codexModel() {
-  if (process.env.DSH_CC_CODEX_MODEL) return process.env.DSH_CC_CODEX_MODEL;
   if (cachedCodexModel === undefined) {
-    try { cachedCodexModel = readFileSync(join(homedir(), ".codex", "config.toml"), "utf8").match(/^model\s*=\s*"([^"]+)"/m)?.[1] ?? null; } catch { cachedCodexModel = null; }
+    try {
+      cachedCodexModel = readFileSync(join(homedir(), ".codex", "config.toml"), "utf8").match(/^\s*model\s*=\s*["']?([^"'\s#]+)["']?\s*$/m)?.[1] ?? null;
+    } catch { cachedCodexModel = null; }
   }
   return cachedCodexModel ?? undefined;
 }
@@ -27,11 +32,21 @@ function codexModel() {
 export const ENGINES = new Set(["claude-code", "codex"]);
 const HARNESSES = { "claude-code": createClaudeCode, codex: createCodex };
 
-export async function createHarnessSession({ engine, cwd }) {
+/**
+ * harness 会话句柄：turn 跑一轮并把流事件回调出来，dispose 回收 bridge。
+ * @typedef {object} HarnessHandle
+ * @property {(prompt: string, options?: { signal?: AbortSignal, onEvent?: (part: import("ai").TextStreamPart<Record<string, import("ai").Tool>>) => void }) => Promise<{ text: string, usage: import("ai").LanguageModelUsage }>} turn
+ * @property {() => Promise<void>} dispose
+ */
+
+/**
+ * @param {{ engine: string, cwd: string, settings?: { codexModel?: string, stripAnthropicEnv?: boolean } }} options
+ * @returns {Promise<HarnessHandle>}
+ */
+export async function createHarnessSession({ engine, cwd, settings }) {
   const port = await freePort();
-  const sandbox = createLocalSandbox({ root: cwd, port });
-  const model = engine === "codex" ? codexModel() : undefined;
-  // codex 的 model 要挂在 agent 上；settings 里的 codexConfig.model 只进 CLI 配置，turn 请求会覆盖它。
+  const sandbox = createLocalSandbox({ root: cwd, port, ...(settings?.stripAnthropicEnv === undefined ? {} : { stripAnthropic: settings.stripAnthropicEnv }) });
+  const model = engine === "codex" ? settings?.codexModel ?? codexModel() : undefined;
   const agent = new HarnessAgent({
     id: engine,
     harness: HARNESSES[engine](model === undefined ? {} : { codexConfig: { model } }),
@@ -40,15 +55,11 @@ export async function createHarnessSession({ engine, cwd }) {
   });
   const session = await agent.createSession({ sandboxSession: sandbox });
   return {
-    /** 跑一轮，返回最终文本与用量。 */
     async turn(prompt, { signal, onEvent } = {}) {
       const result = await agent.stream({ session, prompt, abortSignal: signal });
-      for await (const part of result.fullStream) onEvent?.(part);
-      return { text: (await result.text).trim(), usage: await result.totalUsage };
+      for await (const part of result.stream) onEvent?.(part);
+      return { text: (await result.text).trim(), usage: await result.usage };
     },
-    async dispose() {
-      await session.destroy?.().catch(() => {});
-      await sandbox.destroy();
-    },
+    async dispose() { await session.destroy?.().catch(() => {}); await sandbox.destroy(); },
   };
 }
