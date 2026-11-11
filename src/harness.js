@@ -15,43 +15,36 @@ const freePort = () => new Promise((ok, fail) => {
 });
 
 // adapter 默认写死 gpt-5.5，ChatGPT 账号不认；沿用本机 codex 自己配的 model。
+let cachedCodexModel;
 function codexModel() {
   if (process.env.DSH_CC_CODEX_MODEL) return process.env.DSH_CC_CODEX_MODEL;
-  try {
-    return readFileSync(join(homedir(), ".codex", "config.toml"), "utf8").match(/^model\s*=\s*"([^"]+)"/m)?.[1];
-  } catch {}
+  if (cachedCodexModel === undefined) {
+    try { cachedCodexModel = readFileSync(join(homedir(), ".codex", "config.toml"), "utf8").match(/^model\s*=\s*"([^"]+)"/m)?.[1] ?? null; } catch { cachedCodexModel = null; }
+  }
+  return cachedCodexModel ?? undefined;
 }
 
-const HARNESSES = {
-  "claude-code": (settings) => createClaudeCode(settings),
-  codex: (settings) => createCodex({ codexConfig: { model: codexModel(), ...settings.codexConfig }, ...settings }),
-};
+export const ENGINES = new Set(["claude-code", "codex"]);
+const HARNESSES = { "claude-code": createClaudeCode, codex: createCodex };
 
-export async function createHarnessSession({ engine = "claude-code", cwd, sandboxConfig = { workDir: "." }, settings = {} }) {
+export async function createHarnessSession({ engine, cwd }) {
   const port = await freePort();
   const sandbox = createLocalSandbox({ root: cwd, port });
+  const model = engine === "codex" ? codexModel() : undefined;
+  // codex 的 model 要挂在 agent 上；settings 里的 codexConfig.model 只进 CLI 配置，turn 请求会覆盖它。
   const agent = new HarnessAgent({
     id: engine,
-    harness: HARNESSES[engine](settings),
-    sandboxConfig,
-    // codex adapter 的 model 要挂在 agent 上；设置里的 codexConfig.model 只进 CLI 配置，turn 请求会覆盖它。
-    ...(engine === "codex" && codexModel() !== undefined ? { model: codexModel() } : {}),
+    harness: HARNESSES[engine](model === undefined ? {} : { codexConfig: { model } }),
+    sandboxConfig: { workDir: "." },
+    ...(model === undefined ? {} : { model }),
   });
   const session = await agent.createSession({ sandboxSession: sandbox });
   return {
-    port,
-    session,
-    /** 跑一轮，返回最终文本与这一轮的事件摘要。 */
-    async turn(prompt, { onEvent } = {}) {
-      const result = await agent.stream({ session, prompt });
-      const events = [];
-      let text = "";
-      for await (const part of result.fullStream) {
-        if (part.type === "text-delta") text += part.text ?? part.textDelta ?? "";
-        if (part.type === "tool-call" || part.type === "tool-result" || part.type === "tool-error" || part.type === "finish-step" || part.type === "finish") events.push(part);
-        onEvent?.(part);
-      }
-      return { text: text.trim(), events };
+    /** 跑一轮，返回最终文本与用量。 */
+    async turn(prompt, { signal, onEvent } = {}) {
+      const result = await agent.stream({ session, prompt, abortSignal: signal });
+      for await (const part of result.fullStream) onEvent?.(part);
+      return { text: (await result.text).trim(), usage: await result.totalUsage };
     },
     async dispose() {
       await session.destroy?.().catch(() => {});

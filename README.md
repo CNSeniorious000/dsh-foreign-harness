@@ -6,10 +6,10 @@
 
 ## 结构
 
-- `vendor/agent-loop.js` —— stock loop 的副本，改动：import `createToolResultMessage`、加 `setClaudeStep()`、`step()` 里 `if (claudeStepRunner) return claudeStepRunner(...)`
+- `vendor/agent-loop.js` —— stock loop 的副本，只有两处改动：加 `setClaudeStep()`、`step()` 开头分流（返回 `undefined` 则继续走 stock）
 - `src/index.js` —— 设置分流点并导出 `AgentLoop`
 - `src/claude-step.js` —— 一个 step：把这轮消息写进会话 → 跑 Claude → 把文本/工具调用写成 `assistant/message` + `tool/call` + `tool/result`
-- `src/harness.js` —— 每个 dsh 会话一个 Claude 会话（bridge 端口、`workDir: "."`、跨轮复用、dispose 回收）
+- `src/harness.js` —— 每个 dsh 会话一个 harness 会话（Claude Code / Codex）；bridge 端口、`workDir: "."`、跨轮复用、dispose 回收
 - `src/sandbox.js` —— 把本地目录实现成 `HarnessV1NetworkSandboxSession`（无隔离，接的就是 dsh 的 workspace）
 
 ## 选择引擎

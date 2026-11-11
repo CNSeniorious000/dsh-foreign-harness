@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import z from "@deepseek-ai/schemastery";
 import { brandString } from "@deepseek-ai/dsh-brand";
 import { AgentModel, agentEvents, assembleContextFor, modelSelectionProjectionDefinition } from "@deepseek-ai/dsh-agent";
-import { AssistantStreamAccumulator, BlockAssembler, LlmAttemptId, LlmError, createAssistantMessage, createDeveloperMessage, createSystemMessage, createToolResultMessage, createUserMessage, errorChain, markAgentLoopRequest } from "@deepseek-ai/dsh-llm";
+import { AssistantStreamAccumulator, BlockAssembler, LlmAttemptId, LlmError, createAssistantMessage, createDeveloperMessage, createSystemMessage, createUserMessage, errorChain, markAgentLoopRequest } from "@deepseek-ai/dsh-llm";
 import { SessionLogOffset, SessionPreparation, ToolCallRecovery, canonicalHeader, headerEquals, interruptedTurnClosers, isReplacementSurfaceEvent } from "@deepseek-ai/dsh-session";
 import { SessionPersistenceNotFoundError } from "@deepseek-ai/dsh-session-persistence";
 import { assertNever, deepFreeze } from "@deepseek-ai/dsh-util-values";

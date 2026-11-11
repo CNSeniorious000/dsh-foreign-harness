@@ -8,4 +8,3 @@ setClaudeStep(claudeStep);
 
 export default AgentLoop;
 export { AgentLoop };
-export { claudeStep } from "./claude-step.js";

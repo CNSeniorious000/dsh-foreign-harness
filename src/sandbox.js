@@ -8,23 +8,21 @@ import { randomUUID } from "node:crypto";
 
 const bytesOf = async (content) => (typeof content === "string" ? Buffer.from(content) : content instanceof Uint8Array ? Buffer.from(content) : Buffer.from(await new Response(content).arrayBuffer()));
 
+// 所有 sandbox 共享一个子进程表和一个退出钩子：dsh 直接退出时 effect 清理不跑，bridge 会活下来占端口。
+const children = new Set();
+process.once("exit", () => { for (const child of children) child.kill("SIGKILL"); });
+const reap = () => { for (const child of children) child.kill("SIGKILL"); children.clear(); };
+
+// 引擎继承宿主 env（和终端里跑 claude 一致）。想让它用别的凭据时用 DSH_CC_STRIP_ANTHROPIC=1 剥掉网关变量。
+const baseEnv = process.env.DSH_CC_STRIP_ANTHROPIC === "1" ? Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ANTHROPIC_"))) : process.env;
+
 export function createLocalSandbox({ root, port }) {
   const at = (p) => resolve(root, p);
-  const children = new Set();
-  // dsh 进程直接退出时 effect 清理不会跑，bridge 子进程会活下来占端口。
-  const reap = () => { for (const child of children) child.kill("SIGKILL"); };
-  process.once("exit", reap);
-
-  // 引擎继承宿主 env（和终端里跑 claude 一致）。想让它用别的凭据时用 DSH_CC_STRIP_ANTHROPIC=1 剥掉网关变量。
-  const harnessEnv = () => {
-    if (process.env.DSH_CC_STRIP_ANTHROPIC !== "1") return process.env;
-    return Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("ANTHROPIC_")));
-  };
 
   const start = (options, wantsStdin) => {
     const child = spawnProcess(options.command, {
       cwd: options.workingDirectory ? at(options.workingDirectory) : root,
-      env: { ...harnessEnv(), ...options.env },
+      env: { ...baseEnv, ...options.env },
       shell: true,
       stdio: [wantsStdin ? "pipe" : "ignore", "pipe", "pipe"],
     });
@@ -47,6 +45,8 @@ export function createLocalSandbox({ root, port }) {
     return handle;
   };
 
+  const write = async ({ path, content }) => { await mkdir(dirname(at(path)), { recursive: true }); await writeFileToDisk(at(path), await bytesOf(content)); };
+
   const restricted = {
     description: `Local machine directory ${root}.`,
     readFile: async ({ path }) => { try { return Readable.toWeb(Readable.from(await readFile(at(path)))); } catch { return null; } },
@@ -57,8 +57,8 @@ export function createLocalSandbox({ root, port }) {
         return lines.slice(startLine - 1, endLine ?? lines.length).join("\n");
       } catch { return null; }
     },
-    writeFile: async ({ path, content }) => { await mkdir(dirname(at(path)), { recursive: true }); await writeFileToDisk(at(path), await bytesOf(content)); },
-    writeBinaryFile: async ({ path, content }) => { await mkdir(dirname(at(path)), { recursive: true }); await writeFileToDisk(at(path), await bytesOf(content)); },
+    writeFile: write,
+    writeBinaryFile: write,
     writeTextFile: async ({ path, content, encoding = "utf-8" }) => { await mkdir(dirname(at(path)), { recursive: true }); await writeFileToDisk(at(path), content, encoding); },
     stat: async ({ path }) => { try { const s = await statPath(at(path)); return { type: s.isFile() ? "file" : s.isDirectory() ? "directory" : "other", size: s.size }; } catch { return null; } },
     listDirectory: async ({ path }) => {
@@ -84,7 +84,8 @@ export function createLocalSandbox({ root, port }) {
     getPortEndpoint: async () => ({ url: `ws://127.0.0.1:${port}` }),
     getPortUrl: async () => `http://127.0.0.1:${port}`,
     stop: async () => {},
-    destroy: async () => { for (const child of children) child.kill("SIGKILL"); children.clear(); },
+    destroy: async () => reap(),
+    // bridge 启动阶段会直接在外层对象上调 run/spawn，所以方法既挂 restricted() 也铺一份。
     restricted: () => restricted,
     ...restricted,
   };

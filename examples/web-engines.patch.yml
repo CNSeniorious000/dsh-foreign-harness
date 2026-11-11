@@ -20,7 +20,7 @@
     - id: cc-agent-loop
       name: dsh-cc-agent-loop
 
-    # 引擎选择：模式选择器里的另外两项。id 就是路由键（claude-step.js 里的 ENGINES）。
+    # 引擎选择：模式选择器里的另外两项。config.id 就是引擎名（harness.js 的 ENGINES）。
     # 这两个 preset 只是标签：引擎用自己的系统提示词，dsh 不做任何注入。
     - id: preset-cc-claude
       name: '@deepseek-ai/dsh-agent-preset'
