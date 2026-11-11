@@ -3,8 +3,8 @@
 // 也能用引擎；显式设置项优先，最后才退回宿主环境（终端里跑 claude 的老路径）。
 import { launchEnvironmentOf } from "@deepseek-ai/dsh-launch-environment";
 
-const readField = (field) => (typeof field?.get === "function" ? field.get() : field);
-const defined = (object) => Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
+export const readField = (field) => (typeof field?.get === "function" ? field.get() : field);
+export const defined = (object) => Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
 
 /** provider 的路由配置（baseURL + 凭据引用）在 llm-pi-ai 的 provider 行里，经 configEditor 官方入口读。 */
 function providerProfile(ctx, provider) {
@@ -31,13 +31,18 @@ export async function engineRoute(ctx, agent, engine, settings) {
   const credentials = ctx.get("credentials");
   const storedKey = keyRef === undefined ? undefined : (await credentials?.resolve?.(keyRef))?.value ?? launchEnvironmentOf(ctx).get(keyRef)?.value;
 
+  // 模型语义：dsh 里选的那个就是引擎用的那个（设置项是显式覆盖）；codex 沿用自己的模型体系。
+  const model = engine === "codex"
+    ? settings.codexModel ?? undefined
+    : settings.anthropicModel ?? selection?.model;
+
   const env = {};
   for (const [key, value] of Object.entries(process.env)) if (key.startsWith("ANTHROPIC_") && value) env[key] = value;
   if (engine === "claude-code") {
     const apiKey = settings.anthropicApiKey ?? storedKey;
     Object.assign(env, defined({
       ANTHROPIC_BASE_URL: settings.anthropicBaseUrl ?? profile?.baseURL,
-      ANTHROPIC_MODEL: settings.anthropicModel ?? selection?.model,
+      ANTHROPIC_MODEL: model,
       ANTHROPIC_AUTH_TOKEN: apiKey,
     }));
     // 认证头用 Bearer（AUTH_TOKEN）：CLI 的优先级里 OAuth 文件压过 ANTHROPIC_API_KEY，只有 AUTH_TOKEN 能赢；
@@ -45,10 +50,6 @@ export async function engineRoute(ctx, agent, engine, settings) {
     if (apiKey !== undefined) delete env.ANTHROPIC_API_KEY;
   }
 
-  // 模型语义：dsh 里选的那个就是引擎用的那个（设置项是显式覆盖）；codex 沿用自己的模型体系。
-  const model = engine === "codex"
-    ? settings.codexModel ?? undefined
-    : settings.anthropicModel ?? selection?.model;
   // 会话绑定的 LLM 配置快照（无秘密：凭据只存引用名，值每次现解析）——dsh 侧唯一留存的轻量元数据。
   const llm = defined({ provider: selection?.provider, model, baseURL: profile?.baseURL, apiKeyEnv: profile?.apiKeyEnv });
   return { model, llm, authEnv: Object.keys(env).length > 0 ? env : undefined };

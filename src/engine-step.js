@@ -5,13 +5,11 @@ import { createAssistantMessage, createToolResultMessage, fileHandleText, textOn
 import { appendPluginRecord, pluginRecordOf } from "@deepseek-ai/dsh-session";
 import { createHarnessSession } from "./harness.js";
 import { EngineStreamAttempt } from "./stream-attempt.js";
-import { engineRoute } from "./route.js";
+import { engineRoute, defined } from "./route.js";
 import { engineCliId } from "./archive-sync.js";
 
 /** 引擎会话的持久化记录：harness 的 resume state 交给 dsh 的 plugin record 通道（fork/resume 都携带）。 */
 const STATE_RECORD = "plugin:dsh-foreign-harness/state";
-
-const defined = (object) => Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
 
 /** 只把用户自己说的话喂给引擎；图片/文件按 dsh 的文本投影惯例变成确定性 handle 文本。 */
 function promptOf(messages) {
@@ -53,7 +51,7 @@ function lastStateOf(session) {
 }
 
 /** 每个 dsh 会话一个引擎会话；引擎切换走新 sessionId，互不干扰。 */
-async function engineSessionOf(agent, engine, settings, authEnv) {
+async function engineSessionOf(agent, engine, settings, authEnv, model) {
   const cached = agent.foreignEngineSession;
   if (cached?.engine === engine) return cached;
   if (cached !== undefined) await cached.handle.destroy();
@@ -63,27 +61,31 @@ async function engineSessionOf(agent, engine, settings, authEnv) {
     cwd: agent.session.header?.cwd ?? process.cwd(),
     settings,
     ...(authEnv === undefined ? {} : { authEnv }),
+    ...(model === undefined ? {} : { model }),
     sessionId: state?.sessionId ?? `${agent.session.id}:${engine}`,
     ...(state?.resumeFrom === undefined ? {} : { resumeFrom: state.resumeFrom }),
   });
-  agent.foreignEngineSession = { engine, handle, fresh: state === undefined, llm: state?.llm };
+  agent.foreignEngineSession = { engine, handle, fresh: state === undefined };
   return agent.foreignEngineSession;
 }
 
 /**
  * 引擎会话一有身份就落轻量元数据（SSOT：dsh 只存引擎归属、当时绑定的 LLM 配置、续聊用的引擎会话 id；
  * bridge 坐标/令牌等引擎自身状态留在引擎自己的存储里）。每回合都落——teardown 的 effect 清理在
- * 一次性进程里根本不会跑，靠 dispose 落盘会静默丢记录。写完显式 flush（写缓冲只在请求边界 drain）。
+ * 一次性进程里根本不会跑，靠 dispose 落盘会静默丢记录。内容没变就不重复写；写完显式 flush
+ * （写缓冲只在请求边界 drain）。
  */
-async function rememberEngineState(ctx, agent, engine, engineSession) {
-  const cliId = await engineCliId(engineSession.handle.sessionId);
+async function rememberEngineState(ctx, agent, engine, engineSession, llm, cliIdHint) {
+  const cliId = await engineCliId(engineSession.handle.sessionId, cliIdHint);
   if (cliId === undefined) return;
-  appendPluginRecord(agent.session, STATE_RECORD, {
+  const state = {
     engine,
     sessionId: engineSession.handle.sessionId,
-    ...(engineSession.llm === undefined ? {} : { llm: engineSession.llm }),
+    ...(llm === undefined ? {} : { llm }),
     resumeFrom: { type: "resume-session", harnessId: engine, specificationVersion: "harness-v1", data: engine === "codex" ? { threadId: cliId } : { claudeSessionId: cliId } },
-  });
+  };
+  if (JSON.stringify(lastStateOf(agent.session)) === JSON.stringify(state)) return;
+  appendPluginRecord(agent.session, STATE_RECORD, state);
   await ctx.get("sessions")?.flush?.(agent.session)?.catch?.(() => {});
 }
 
@@ -115,11 +117,14 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   for (const message of decision.messages) session.append("user/message", message, { surfaceOp: "append" });
 
   const route = await engineRoute(ctx, agent, engine, settings);
-  const engineSession = await engineSessionOf(agent, engine, settings, route.authEnv);
-  engineSession.llm = route.llm;
+  const engineSession = await engineSessionOf(agent, engine, settings, route.authEnv, route.model);
   const prompt = promptOf(decision.messages);
-  // 引擎会话全新（接不回原对话）才摊历史兜底；能接回时上下文在引擎自己手里，不重复喂。
-  const context = engineSession.fresh ? historyTextOf(session, new Set(decision.messages.map((message) => message.id))) : "";
+  // 引擎会话全新（接不回原对话）才摊历史兜底，且只摊这一次——之后上下文在引擎自己手里，再喂就重复了。
+  let context = "";
+  if (engineSession.fresh) {
+    engineSession.fresh = false;
+    context = historyTextOf(session, new Set(decision.messages.map((message) => message.id)));
+  }
   const input = context === "" ? prompt : `${context}\n\n（以上是此前的对话记录。下面是用户的新消息。）\n\n${prompt}`;
   if (input === "") throw new Error(`${engine}: nothing to run — this turn has no user content`);
 
@@ -153,6 +158,7 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   };
 
   let usage;
+  let cliIdHint;
   let finishReason = { kind: "stop" };
   const takeUsage = (raw) => {
     usage = defined({
@@ -231,15 +237,15 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
     if (part.type === "finish") {
       finishReason = finishKindOf(part.finishReason);
       if (part.totalUsage !== undefined) takeUsage(part.totalUsage);
+      // 引擎侧会话 id 官方就挂在 finish 部件的 providerMetadata（harness 透传 harnessMetadata）上。
+      cliIdHint ??= part.providerMetadata?.["claude-code"]?.sessionId ?? part.providerMetadata?.codex?.threadId ?? part.providerMetadata?.["codex"]?.threadId;
     }
   };
 
   try {
     attempt.start();
     await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
-    await rememberEngineState(ctx, agent, engine, engineSession);
   } catch (error) {
-    await rememberEngineState(ctx, agent, engine, engineSession);
     // 中断/失败也把可见产出落盘（stock 同款 interrupted），否则界面上这轮凭空消失。
     const content = signal.aborted ? attempt.interruptedBlocks() : [];
     if (content.length > 0) {
@@ -250,6 +256,8 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
       attempt.settle("assistant/attempt", () => session.append("assistant/attempt", { turn, step, stream: attempt.stream }).seq);
     }
     throw error;
+  } finally {
+    await rememberEngineState(ctx, agent, engine, engineSession, route.llm, cliIdHint);
   }
 
   if (usage !== undefined) attempt.push({ type: "usage", usage });
