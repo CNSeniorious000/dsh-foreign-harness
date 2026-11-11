@@ -17,8 +17,8 @@
     model: deepseek-flash
 
 - insert:
-    - id: cc-agent-loop
-      name: dsh-cc-agent-loop
+    - id: foreign-harness
+      name: dsh-foreign-harness
 
     # 引擎选择：模式选择器里的另外两项。config.id 就是引擎名（harness.js 的 ENGINES）。
     # 这两个 preset 只是标签：引擎用自己的系统提示词，dsh 不做任何注入。

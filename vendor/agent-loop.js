@@ -12,7 +12,7 @@ import { joinContextSections, renderContextSections, renderPrompt } from "@deeps
 import { ToolActivationError, ToolBatchExecutionError } from "@deepseek-ai/dsh-tools";
 import { z as z$1 } from "zod";
 let claudeStepRunner = null;
-/** 由 dsh-cc-agent-loop 注入：非空时由 Claude Code 驱动每一步。 */
+/** 由 dsh-foreign-harness 注入：非空时由 Claude Code 驱动每一步。 */
 export function setClaudeStep(fn) { claudeStepRunner = fn; }
 //#region lib/types/inbox.js
 /**

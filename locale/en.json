@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Foreign harness",
+    "description": "Run Claude Code / Codex as the dsh agent loop. Their tool calls render as native dsh cards."
+  }
+}

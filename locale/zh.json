@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "外来 Harness",
+    "description": "以 Claude Code / Codex 驱动 dsh 的智能体运行循环，工具调用显示为 dsh 原生卡片。"
+  }
+}
