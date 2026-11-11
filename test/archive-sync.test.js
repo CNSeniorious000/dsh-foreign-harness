@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { syncPlan } from "../src/archive-sync.js";
+import { syncPlan, threadOfRollout } from "../src/archive-sync.js";
 
 describe("syncPlan", () => {
   test("baseline (either prev undefined) only seeds, never writes", () => {
@@ -27,5 +27,14 @@ describe("syncPlan", () => {
     expect(syncPlan(false, false, true, true)).toBeUndefined();
     expect(syncPlan(true, true, false, false)).toBeUndefined();
     expect(syncPlan(false, true, true, false)).toBeUndefined();
+  });
+});
+
+describe("threadOfRollout", () => {
+  test("rollout filename tail is the thread id, plain or zst", () => {
+    expect(threadOfRollout("rollout-2026-04-21T15-05-03-019daedb-5656-7ef3-ba88-d33c7cf4a016.jsonl")).toBe("019daedb-5656-7ef3-ba88-d33c7cf4a016");
+    expect(threadOfRollout("2026/11/12/rollout-2026-11-12T01-02-03-01a1cb9a-b181-7001-a516-cf1aed84eb7e.jsonl.zst")).toBe("01a1cb9a-b181-7001-a516-cf1aed84eb7e");
+    expect(threadOfRollout("session_index.jsonl")).toBeUndefined();
+    expect(threadOfRollout("rollout-2026-04-21T15-05-03.jsonl")).toBeUndefined();
   });
 });
