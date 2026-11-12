@@ -11,7 +11,7 @@ kind: "package-reference"
 
 `dsh-foreign-harness` 让外来编码智能体驱动 dsh 的回合：dsh 负责会话、界面和事件；Claude Code / Codex（经 AI SDK harness 适配器）负责思考和动手。工具调用被翻译成 `tool/call` + `tool/result` 事件，于是 web 里用的是 dsh 自己的工具卡。
 
-集成方式是 **替换 step，而不是替换 loop**：插件子类化 stock 的 `@deepseek-ai/dsh-agent-loop`（无 vendored 副本），把每个 agent 的 `step()` 实例方法换成按 preset 路由——引擎 preset 跑 harness 回合，其余原样走未动过的 stock step。inbox、turn/step 编排、事件、preset 插件全是上游原装，逐 step 路由让换模式、冷恢复、任意切换顺序都天然正确。
+集成方式是 **替换 step，而不是替换 loop**：插件子类化 stock 的 `@deepseek-ai/dsh-agent-loop`（无 vendored 副本），把每个 agent 的 `step()` 实例方法换成按 preset 路由——引擎 preset 跑 harness 回合，其余原样走未动过的 stock step。inbox、turn/step 编排、事件、preset 插件全是上游原装，逐 step 路由保证换模式/冷恢复的路由正确；各引擎保留自己的线程（见下）。
 
 ## 目录
 
@@ -63,10 +63,12 @@ dsh --profile <p> --patch ./patch.yml "看一下 note.txt"
 ## 实现结构
 
 - `src/index.js` —— `ForeignHarnessLoop`（stock `AgentLoop` 子类）：给每个创建/恢复的 agent 打上 step 引擎路由；引擎会话在 owner teardown 时经 `disposeEngineSession` 停掉
-- `src/engine-step.js` —— 一个引擎回合：用户消息 → harness 回合 → 实时 `agent/assistant-stream` 帧 → durable `assistant/message`（带紧凑 stream）+ `tool/call` + `tool/result`；引擎会话的 resume state 以 `plugin:dsh-foreign-harness/state` 记录持久化，对话可跨进程接续
+- `src/engine-step.js` —— 一个引擎回合：用户消息 → harness 回合 → 实时 `agent/assistant-stream` 帧 → durable `assistant/message`（带紧凑 stream）+ `tool/call` + `tool/result`；引擎会话的 resume state 以 `plugin:dsh-foreign-harness/state` 记录持久化，对话可跨进程接续。引擎内部的 `start-step`/`finish-step` 边界落成顺序的顶级 dsh `step/start`/`step/end`；stock loop 外层的编排 step 在引擎回合被过滤掉，released 日志保持连续、UI 步数等于引擎真实子步数
 - `src/harness.js` —— 每个 dsh 会话一个 harness 会话（bridge 端口、`workDir: "."`、`detach`/`stop` resume state、dispose）
 - `src/sandbox.js` —— 把本地目录实现成 `HarnessV1NetworkSandboxSession`（无隔离，接的就是 dsh 的 workspace）
 - `src/stream-attempt.js` —— 实时 assistant 流的帧协议（start → chunk* → end，revision 单调），用 dsh-llm 的公开原语实现
+
+每个引擎保留自己的原生线程。切换引擎时新引擎用纯文本历史兜底；切回旧引擎续它自己的线程，不包含另一引擎处理过的回合。
 
 客户端投影的硬契约（违反任何一条渲染就坏）：
 
@@ -77,7 +79,7 @@ dsh --profile <p> --patch ./patch.yml "看一下 note.txt"
 
 ## 测试
 
-`bun test` 跑 `test/sandbox.test.js`（sandbox 适配器的文件/进程往返）。引擎路径拿真实 profile 验证：
+`bun test` 覆盖 sandbox 适配器的文件/进程往返、归档同步规划、引擎 step 事件序（含 released 日志校验）和 stream attempt 生命周期。引擎路径另外拿真实 profile 验证：
 
 ```sh
 DSH_CC_ENGINE=claude-code dsh --profile <p> --patch ./patch.yml "收到请回复收到"
