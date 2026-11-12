@@ -93,3 +93,48 @@ test("empty-reasoning blocks are dropped and usage lands flat", async () => {
   // 嵌套 usage 摊平成数字（codex adapter 的形状）。
   expect(message.data.usage).toEqual({ inputTokens: 5, outputTokens: 6, cacheReadTokens: 2, cacheWriteTokens: undefined });
 });
+
+test("segment end invalidates the block ledger; late deltas for stale ids open a fresh segment", async () => {
+  // 块没关就收段（finish-step），段尾后迟到的 delta/end 不得打到已退役的 attempt。
+  const { events } = await run([
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "a" },
+    { type: "finish-step", finishReason: "tool-calls" },
+    { type: "text-delta", id: "t1", text: "b" },
+    { type: "text-end", id: "t1" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  expect(events.map((e) => e.type)).toEqual([
+    "user/message",
+    "step/start", "assistant/message", "step/end",
+    "step/start", "assistant/message", "step/end",
+  ]);
+  expect(events.filter((e) => e.type === "assistant/message").map((e) => e.data.message.content[0].text)).toEqual(["a", "b"]);
+});
+
+test("mixed usage shapes flatten per field", async () => {
+  const { events } = await run([
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "a" },
+    { type: "text-end", id: "t1" },
+    { type: "finish-step", usage: { inputTokens: { total: 5, cacheRead: 2 }, outputTokens: 6 }, finishReason: "stop" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  const message = events.find((e) => e.type === "assistant/message");
+  expect(message.data.usage).toEqual({ inputTokens: 5, outputTokens: 6, cacheReadTokens: 2 });
+});
+
+test("late tool result commits exactly once, at its call's step", async () => {
+  const { events } = await run([
+    { type: "tool-call", toolCallId: "c1", toolName: "bash", input: { command: "x" } },
+    { type: "finish-step", finishReason: "tool-calls" },
+    { type: "tool-result", toolCallId: "c1", providerExecuted: true, output: "real" },
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "done" },
+    { type: "text-end", id: "t1" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  const results = events.filter((e) => e.type === "tool/result");
+  expect(results.map((e) => e.data.message.content[0].text)).toEqual(["real"]);
+  expect(results[0].data.step).toBe(events.find((e) => e.type === "tool/call").data.step);
+});

@@ -119,9 +119,10 @@ const finishKindOf = (reason) => {
 // 整个对象当 token 数存进 durable message（UI 读数直接坏）。
 const normalizeUsage = (raw) => {
   const nested = typeof raw.inputTokens === "object" && raw.inputTokens !== null;
+  const outputNested = typeof raw.outputTokens === "object" && raw.outputTokens !== null;
   return defined({
     inputTokens: (nested ? raw.inputTokens.total : raw.inputTokens) ?? 0,
-    outputTokens: (nested ? raw.outputTokens?.total : raw.outputTokens) ?? 0,
+    outputTokens: (outputNested ? raw.outputTokens.total : raw.outputTokens) ?? 0,
     totalTokens: raw.totalTokens,
     cacheReadTokens: nested ? raw.inputTokens?.cacheRead : raw.inputTokenDetails?.cacheReadTokens,
     cacheWriteTokens: nested ? raw.inputTokens?.cacheWrite : raw.inputTokenDetails?.cacheWriteTokens,
@@ -182,23 +183,25 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     open.clear();
     dbg({ event: "segment/start", turn, step: segStep });
   };
-  /** @type {Map<string, number>} callId → tool/call 事件 seq（tool/result 回指用） */
+  /** @type {Map<string, {seq: number, step: number}>} callId → tool/call 事件（tool/result 回指与补果用） */
   const callSeqs = new Map();
   const reported = new Set();
 
   const dispatchToolCall = (callId, name, args) => {
     if (callSeqs.has(callId)) return;
     const seq = session.append("tool/call", { turn, step: attempt.step, callId, name, arguments: args }).seq;
-    callSeqs.set(callId, seq);
+    callSeqs.set(callId, { seq, step: attempt.step });
     dbg({ event: "tool/call", seq, turn, step: attempt.step, name });
   };
   const commitToolResult = (callId, text, isError) => {
-    const callSeq = callSeqs.get(callId);
-    if (callSeq === undefined) return;
+    const call = callSeqs.get(callId);
+    if (call === undefined || reported.has(callId)) return;
     reported.add(callId);
-    const seq = session.append("tool/result", { turn, step: attempt.step, message: createToolResultMessage({ callId, content: [{ type: "text", text }], isError }) }, { surfaceOp: "append", sourceEventSeqs: [callSeq] }).seq;
-    dbg({ event: "tool/result", seq, turn, step: attempt.step });
+    const seq = session.append("tool/result", { turn, step: call.step, message: createToolResultMessage({ callId, content: [{ type: "text", text }], isError }) }, { surfaceOp: "append", sourceEventSeqs: [call.seq] }).seq;
+    dbg({ event: "tool/result", seq, turn, step: call.step });
   };
+  /** 已调用但没回报的补一个终止结果，否则卡片永远停在「运行中」。turn 收尾才补：段间迟到的真结果不该被占位顶掉成双果。 */
+  const backfillMissingResults = () => { for (const callId of callSeqs.keys()) commitToolResult(callId, "(no result)", true); };
 
   // 流翻译的块索引账本（per attempt，段切换时重置）：harness 的部件 id → dsh 的块序号与缓冲。
   let index = 0;
@@ -221,7 +224,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     segEvents.push(event);
   };
 
-  /** 段收尾：finish 帧 → settle 段消息 → 落工具事件 → 补无果调用 → step/end 退役 retained 流帧。 */
+  /** 段收尾：finish 帧 → settle 段消息 → 落工具事件 → step/end 退役 retained 流帧。 */
   const finishSegment = ({ reason, usage, mode = "normal" }) => {
     if (usage !== undefined) attempt.push({ type: "usage", usage });
     attempt.push({ type: "finish", reason });
@@ -241,16 +244,16 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       else commitToolResult(event.callId, event.text, event.isError);
     }
     segEvents.length = 0;
-    // 已调用但没回报的补一个终止结果，否则卡片永远停在「运行中」。
-    for (const callId of callSeqs.keys()) if (!reported.has(callId)) commitToolResult(callId, "(no result)", true);
     session.append("step/end", { turn, step: attempt.step });
     dbg({ event: "segment/end", turn, step: attempt.step });
+    open.clear(); // 块台账只活在本段：留着的话，段尾后迟到的 delta/end 会拿陈旧 entry 打到 null attempt
     attempt = null;
   };
 
   let cliIdHint;
   let debugSeq = 0;
   let finishReason = { kind: "stop" };
+  let finishUsage;
 
   const translate = (part) => {
     // 诊断通道：DSH_FH_DEBUG=<path> 时把引擎流部件的形态按序落盘（字段名/大小，不含正文）。
@@ -328,6 +331,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     }
     if (part.type === "finish") {
       finishReason = finishKindOf(part.finishReason);
+      if (part.usage !== undefined) finishUsage = normalizeUsage(part.usage);
       // 引擎侧会话 id 官方就挂在 finish 部件的 providerMetadata（harness 透传 harnessMetadata）上。
       cliIdHint ??= part.providerMetadata?.["claude-code"]?.sessionId ?? part.providerMetadata?.codex?.threadId ?? part.providerMetadata?.["codex"]?.threadId;
     }
@@ -339,14 +343,16 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   } catch (error) {
     // 中断/失败也把可见产出落盘（stock 同款 interrupted），否则界面上这轮凭空消失。
     const aborted = signal.aborted;
-    if (attempt !== null && !attempt.ended) finishSegment({ reason: finishKindOf(aborted ? "abort" : "error"), mode: aborted ? "interrupted" : "failed" });
+    if (attempt !== null && !attempt.ended) finishSegment({ reason: finishKindOf(aborted ? "abort" : "error"), usage: finishUsage, mode: aborted ? "interrupted" : "failed" });
+    backfillMissingResults();
     throw error;
   } finally {
     await rememberEngineState(ctx, agent, engine, engineSession, route.llm, cliIdHint);
   }
 
   // 引擎没有 finish-step 收尾的尾巴（例如最后只发 finish 部件）也要落盘收口。
-  if (attempt !== null && !attempt.ended) finishSegment({ reason: finishReason });
+  if (attempt !== null && !attempt.ended) finishSegment({ reason: finishReason, usage: finishUsage });
+  backfillMissingResults();
 
   return finishReason.kind === "max-tokens" ? { kind: "max-tokens" } : { kind: "completed" };
 }
