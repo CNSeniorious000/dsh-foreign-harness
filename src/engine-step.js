@@ -1,6 +1,9 @@
 // 一个引擎回合：把这轮的用户消息交给 harness 引擎跑完整回合（工具循环在引擎内部），
 // 流事件实时翻译成 dsh 的 StreamChunk 走 agent/assistant-stream 帧（UI 边跑边渲染），
 // 终局落成 durable 事件：assistant/message（带紧凑 stream）+ tool/call + tool/result。
+// 引擎的每个内部 step（start-step/finish-step 边界）是一个「段」：段消息先 settle、段内工具事件后落——
+// 与 stock「LLM 返回含 tool-call 的 message 后才 dispatch 工具」同形。折叠引擎落盘时按 settled.seq
+// 重建锚点（firstVisibleSeq 是瞬态），工具事件若先落，思考行会被挤到工具卡之后。
 import { appendFileSync } from "node:fs";
 import { createAssistantMessage, createToolResultMessage, fileHandleText, textOnlyImageText } from "@deepseek-ai/dsh-llm";
 import { appendPluginRecord, pluginRecordOf } from "@deepseek-ai/dsh-session";
@@ -111,6 +114,22 @@ const finishKindOf = (reason) => {
   return { kind: "stop" };
 };
 
+// usage 两代形状都要认：平铺（inputTokens: number + inputTokenDetails）与嵌套
+// （inputTokens: {total, cacheRead, cacheWrite}）——codex adapter 发的是后者，不摊平会把
+// 整个对象当 token 数存进 durable message（UI 读数直接坏）。
+const normalizeUsage = (raw) => {
+  const nested = typeof raw.inputTokens === "object" && raw.inputTokens !== null;
+  const input = nested ? raw.inputTokens?.total : raw.inputTokens;
+  const output = typeof raw.outputTokens === "object" && raw.outputTokens !== null ? raw.outputTokens?.total : raw.outputTokens;
+  return defined({
+    inputTokens: input ?? 0,
+    outputTokens: output ?? 0,
+    totalTokens: raw.totalTokens,
+    cacheReadTokens: nested ? raw.inputTokens?.cacheRead : raw.inputTokenDetails?.cacheReadTokens,
+    cacheWriteTokens: nested ? raw.inputTokens?.cacheWrite : raw.inputTokenDetails?.cacheWriteTokens,
+  });
+};
+
 /**
  * 跑一个引擎回合。返回 {kind:"completed"} | {kind:"max-tokens"}（stock step 的返回契约）；
  * 失败/中断先落可见产出再抛。decision.messages 会像 stock 一样落成 user/message。
@@ -133,37 +152,38 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   const input = context === "" ? prompt : `${context}\n\n（以上是此前的对话记录。下面是用户的新消息。）\n\n${prompt}`;
   if (input === "") throw new Error(`${engine}: nothing to run — this turn has no user content`);
 
-  const attempt = new EngineStreamAttempt({
-    sessionId: session.id,
-    attempt: (agent.foreignAttempt = (agent.foreignAttempt ?? 0) + 1),
-    turn,
-    step,
-    nextRevision: () => (agent.foreignRevision = (agent.foreignRevision ?? 0) + 1),
-    emit: (frame) => agent.dispatch.emit("agent/assistant-stream", { frame }),
-  });
-
   const selection = agent.model.current();
   const source = { provider: engine, model: selection?.model ?? "default" };
+  const dbg = (obj) => { if (process.env.DSH_FH_DEBUG) appendFileSync(process.env.DSH_FH_DEBUG, JSON.stringify(obj) + "\n"); };
+
+  // 每个引擎内部 step 是一个「段」：独立 attempt（独立折叠上下文 turn:step），段消息 settle 后才落
+  // 该段的工具事件（锚序 = stock 形态），段尾 step/end 把 retained 流帧退役掉（否则下一段 attempt 的
+  // start 帧触发 rebaseline）。段 0 复用 loop 的 step/start；后续段用 step+k 自带 start/end。
+  let segIndex = 0;
+  /** @type {EngineStreamAttempt | null} 当前段的流 attempt（null = 无活跃段） */
+  let attempt = null;
+  let segUsage;
+  /** 段内攒下的工具事件（到达序）：tool/call+tool/result 在段消息 settle 之后统一落。 */
+  const segEvents = [];
   /** @type {Map<string, number>} callId → tool/call 事件 seq（tool/result 回指用） */
   const callSeqs = new Map();
   const reported = new Set();
-  // tool/call 在调用落定的瞬间就发（stock 的 dispatch 语义）：卡片从 preparing 转正才能展开，
-  // result 也才有配对锚点——攒到回合结束才发的话，整个回合的卡片都是不可展开的空壳草稿。
-  const dbg = (obj) => { if (process.env.DSH_FH_DEBUG) appendFileSync(process.env.DSH_FH_DEBUG, JSON.stringify(obj) + "\n"); };
+
   const dispatchToolCall = (callId, name, args) => {
     if (callSeqs.has(callId)) return;
-    const seq = session.append("tool/call", { turn, step, callId, name, arguments: args }).seq;
+    const seq = session.append("tool/call", { turn, step: attempt.step, callId, name, arguments: args }).seq;
     callSeqs.set(callId, seq);
-    dbg({ event: "tool/call", seq, turn, step, name });
+    dbg({ event: "tool/call", seq, turn, step: attempt.step, name });
   };
   const commitToolResult = (callId, text, isError) => {
     const callSeq = callSeqs.get(callId);
     if (callSeq === undefined) return;
     reported.add(callId);
-    const seq = session.append("tool/result", { turn, step, message: createToolResultMessage({ callId, content: [{ type: "text", text }], isError }) }, { surfaceOp: "append", sourceEventSeqs: [callSeq] }).seq;
-    dbg({ event: "tool/result", seq, turn, step });
+    const seq = session.append("tool/result", { turn, step: attempt.step, message: createToolResultMessage({ callId, content: [{ type: "text", text }], isError }) }, { surfaceOp: "append", sourceEventSeqs: [callSeq] }).seq;
+    dbg({ event: "tool/result", seq, turn, step: attempt.step });
   };
-  // 流翻译的块索引账本：harness 的部件 id → dsh 的块序号与缓冲。
+
+  // 流翻译的块索引账本（per attempt，段切换时重置）：harness 的部件 id → dsh 的块序号与缓冲。
   let index = 0;
   const open = new Map();
   const openBlock = (id, kind, extra) => {
@@ -179,19 +199,58 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
     attempt.push({ type: "block-end", index: entry.index, block });
   };
 
-  let usage;
+  const beginSegment = () => {
+    // 段从 step+1 起号：loop 会给本 step 发 step/start+step/end 配对（空壳、无内容不渲染），
+    // 段自带完整的 start/end 配对——复用 loop 的 step 号会让 step/end 被双关（日志直接 corrupt：
+    // step/end does not match an open turn and step）。
+    const segStep = step + 1 + segIndex++;
+    session.append("step/start", { turn, step: segStep });
+    attempt = new EngineStreamAttempt({
+      sessionId: session.id,
+      attempt: (agent.foreignAttempt = (agent.foreignAttempt ?? 0) + 1),
+      turn,
+      step: segStep,
+      nextRevision: () => (agent.foreignRevision = (agent.foreignRevision ?? 0) + 1),
+      emit: (frame) => agent.dispatch.emit("agent/assistant-stream", { frame }),
+    });
+    attempt.start();
+    index = 0;
+    open.clear();
+    dbg({ event: "segment/start", turn, step: segStep });
+  };
+
+  /** 段收尾：finish 帧 → settle 段消息 → 落工具事件 → 补无果调用 → step/end 退役 retained 流帧。 */
+  const finishSegment = ({ reason, mode = "normal" }) => {
+    const current = attempt;
+    if (segUsage !== undefined) current.push({ type: "usage", usage: segUsage });
+    current.push({ type: "finish", reason: reason ?? { kind: "stop" } });
+    // 空文本/空思考块不落（codex 会发 reasoning-start/end 零 delta 的空思考），UI 靠块渲染卡片。
+    const content = (mode === "interrupted" ? current.interruptedBlocks() : mode === "failed" ? [] : current.blocks()).filter((block) => (block.type !== "text" && block.type !== "reasoning") || block.text.trim() !== "");
+    if (content.length > 0) {
+      current.settle("assistant/message", () => {
+        const seq = session.append("assistant/message", { turn, step: current.step, message: createAssistantMessage({ content, source }), stream: current.stream, ...(mode === "interrupted" ? { interrupted: true } : {}), ...(segUsage === undefined ? {} : { usage: segUsage }) }, { surfaceOp: "append" }).seq;
+        dbg({ event: "assistant/message", seq, turn, step: current.step });
+        return seq;
+      });
+    } else if (!current.ended) {
+      current.settle("assistant/attempt", () => session.append("assistant/attempt", { turn, step: current.step, stream: current.stream }).seq);
+    }
+    for (const event of segEvents) {
+      if (event.kind === "call") dispatchToolCall(event.callId, event.name, event.args);
+      else commitToolResult(event.callId, event.text, event.isError);
+    }
+    segEvents.length = 0;
+    // 已调用但没回报的补一个终止结果，否则卡片永远停在「运行中」。
+    for (const callId of callSeqs.keys()) if (!reported.has(callId)) commitToolResult(callId, "(no result)", true);
+    session.append("step/end", { turn, step: current.step });
+    dbg({ event: "segment/end", turn, step: current.step });
+    attempt = null;
+    segUsage = undefined;
+  };
+
   let cliIdHint;
   let debugSeq = 0;
   let finishReason = { kind: "stop" };
-  const takeUsage = (raw) => {
-    usage = defined({
-      inputTokens: raw.inputTokens ?? 0,
-      outputTokens: raw.outputTokens ?? 0,
-      totalTokens: raw.totalTokens,
-      cacheReadTokens: raw.inputTokenDetails?.cacheReadTokens,
-      cacheWriteTokens: raw.inputTokenDetails?.cacheWriteTokens,
-    });
-  };
 
   const translate = (part) => {
     // 诊断通道：DSH_FH_DEBUG=<path> 时把引擎流部件的形态按序落盘（字段名/大小，不含正文）。
@@ -201,6 +260,9 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
       for (const key of ["text", "delta", "input", "output", "error"]) if (part[key] !== undefined) shape[key + "Len"] = JSON.stringify(part[key])?.length;
       appendFileSync(process.env.DSH_FH_DEBUG, JSON.stringify(shape) + "\n");
     }
+    // 只有产出部件才建段：finish/finish-step/start-step/raw 是控制件，回合末的 finish 会紧跟着
+    // 最后一个 finish-step 到达，跟着建段就是凭空多一个空 step。
+    if (attempt === null && part.type !== "finish" && part.type !== "finish-step" && part.type !== "start-step" && part.type !== "raw") beginSegment();
     if (part.type === "text-start") openBlock(part.id, "text");
     if (part.type === "text-delta") {
       const entry = open.get(part.id) ?? openBlock(part.id, "text");
@@ -253,58 +315,44 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
         }
         closeBlock(toolCallId, { type: "tool-call", id: toolCallId, name, arguments: entry.args });
       }
-      dispatchToolCall(toolCallId, name, args);
+      segEvents.push({ kind: "call", callId: toolCallId, name, args });
     }
-    // 工具结果（引擎内部执行，providerExecuted 才是真结果）——到一个落一个，卡片即时收口。
+    // 工具结果（引擎内部执行，providerExecuted 才是真结果）——先攒着，段消息 settle 后按到达序落。
     if ((part.type === "tool-result" || part.type === "tool-output-available") && part.providerExecuted) {
       const output = typeof part.output === "string" ? part.output : JSON.stringify(part.output) ?? "";
-      commitToolResult(part.toolCallId, output.slice(0, 8000), false);
+      segEvents.push({ kind: "result", callId: part.toolCallId, text: output.slice(0, 8000), isError: false });
     }
     if ((part.type === "tool-error" || part.type === "tool-output-error") && part.providerExecuted) {
       const error = part.error ?? part.errorText;
-      commitToolResult(part.toolCallId, String(error?.message ?? error).slice(0, 8000), true);
+      segEvents.push({ kind: "result", callId: part.toolCallId, text: String(error?.message ?? error).slice(0, 8000), isError: true });
     }
-    if (part.type === "finish-step" && part.usage !== undefined) takeUsage(part.usage);
+    if (part.type === "finish-step" && attempt !== null) {
+      if (part.usage !== undefined) segUsage = normalizeUsage(part.usage);
+      finishSegment({ reason: finishKindOf(part.finishReason) });
+    }
     if (part.type === "finish") {
       finishReason = finishKindOf(part.finishReason);
-      if (part.totalUsage !== undefined) takeUsage(part.totalUsage);
       // 引擎侧会话 id 官方就挂在 finish 部件的 providerMetadata（harness 透传 harnessMetadata）上。
       cliIdHint ??= part.providerMetadata?.["claude-code"]?.sessionId ?? part.providerMetadata?.codex?.threadId ?? part.providerMetadata?.["codex"]?.threadId;
     }
   };
 
   try {
-    attempt.start();
+    beginSegment();
     await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
     engineSession.fresh = false;
   } catch (error) {
     // 中断/失败也把可见产出落盘（stock 同款 interrupted），否则界面上这轮凭空消失。
-    const content = signal.aborted ? attempt.interruptedBlocks() : [];
-    if (content.length > 0) {
-      attempt.settle("assistant/message", () =>
-        session.append("assistant/message", { turn, step, message: createAssistantMessage({ content, source }), stream: attempt.stream, interrupted: true, ...(usage === undefined ? {} : { usage }) }, { surfaceOp: "append" }).seq,
-      );
-    } else if (!attempt.ended) {
-      attempt.settle("assistant/attempt", () => session.append("assistant/attempt", { turn, step, stream: attempt.stream }).seq);
-    }
-    // 中断时未回报的调用同样补终止结果，卡片不能永远「运行中」。
-    for (const callId of callSeqs.keys()) if (!reported.has(callId)) commitToolResult(callId, "(no result)", true);
+    if (attempt !== null && !attempt.ended) finishSegment({ reason: finishKindOf(signal.aborted ? "abort" : "error"), mode: signal.aborted ? "interrupted" : "failed" });
     throw error;
   } finally {
+    // 合成段占掉的 step 编号要记入 loop 的账本，否则下一个 stock step 撞号（同 turn:step 折叠成一个节点）。
+    if (segIndex > 0 && agent.phase !== undefined) agent.phase.step = Math.max(agent.phase.step ?? 0, step + segIndex);
     await rememberEngineState(ctx, agent, engine, engineSession, route.llm, cliIdHint);
   }
 
-  if (usage !== undefined) attempt.push({ type: "usage", usage });
-  attempt.push({ type: "finish", reason: finishReason });
-  const content = attempt.blocks();
-  attempt.settle("assistant/message", () => {
-    const seq = session.append("assistant/message", { turn, step, message: createAssistantMessage({ content, source }), stream: attempt.stream, ...(usage === undefined ? {} : { usage }) }, { surfaceOp: "append" }).seq;
-    dbg({ event: "assistant/message", seq, turn, step });
-    return seq;
-  });
-
-  // 已调用但没回报的补一个终止结果，否则卡片永远停在「运行中」。
-  for (const callId of callSeqs.keys()) if (!reported.has(callId)) commitToolResult(callId, "(no result)", true);
+  // 引擎没有 finish-step 收尾的尾巴（例如最后只发 finish 部件）也要落盘收口。
+  if (attempt !== null && !attempt.ended) finishSegment({ reason: finishReason });
 
   return finishReason.kind === "max-tokens" ? { kind: "max-tokens" } : { kind: "completed" };
 }
