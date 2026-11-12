@@ -1,9 +1,12 @@
 // runEngineStep 的事件序契约：段消息先 settle、段内工具事件后落（折叠锚序的关键），
 // 每段 step/start+step/end 配对、控制部件（finish 等）不产生空段。
 import { test, expect, mock } from "bun:test";
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
+import { restoreReleasedV4Artifact } from "@deepseek-ai/dsh-session-format-v3-to-v4";
 
 const parts = [];
 mock.module("../src/harness.js", () => ({
+  ENGINES: new Set(["claude-code", "codex"]),
   createHarnessSession: async () => ({
     sessionId: "harness-test",
     turn: async (_input, { onEvent }) => { for (const part of parts) onEvent(part); },
@@ -13,6 +16,7 @@ mock.module("../src/harness.js", () => ({
 }));
 // mock.module 要先于被测模块加载（import 声明会提升），故动态 import。
 const { runEngineStep } = await import("../src/engine-step.js");
+const { guardEngineStepBoundaries } = await import("../src/index.js");
 
 const makeAgent = (events) => ({
   session: {
@@ -21,9 +25,9 @@ const makeAgent = (events) => ({
     seq: 0,
     eventAt: () => undefined,
     deriveMessages: () => [],
-    append: (type, data) => {
-      events.push({ type, data });
-      return { seq: events.length };
+    append: (type, data, options) => {
+      events.push({ type, data, ...(options?.surfaceOp === undefined ? {} : { surfaceOp: options.surfaceOp }), ...(options?.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: options.sourceEventSeqs }) });
+      return { seq: events.length - 1 };
     },
   },
   model: { current: () => ({ provider: "test", model: "m" }) },
@@ -41,10 +45,22 @@ const run = async (streamParts) => {
     engine: "claude-code",
     settings: {},
     ctx: { get: () => undefined },
-    claimStep: () => ++step,
+    claimStep: () => step++,
   });
+  // 单元里直接调 runEngineStep，没有 stock turn()；补上 turn 边界后让 released 校验器守门。
+  assertReleasedLog(events);
   return { events, result };
 };
+
+const assertReleasedLog = (events) => restoreReleasedV4Artifact({
+  header: { version: 4, id: "s1", createdAt: 0, cwd: "/tmp", isSeeded: false, delegationDepth: 0 },
+  inheritedEventCount: 0,
+  events: [
+    { type: "turn/start", data: { turn: 1 } },
+    ...events,
+    { type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } },
+  ].map((event, seq) => ({ ...event, seq, time: 0 })),
+}, KNOWN_SESSION_EVENT_TYPES);
 
 test("segment settle precedes its tool events; segments pair step/start with step/end", async () => {
   const { events, result } = await run([
@@ -70,9 +86,9 @@ test("segment settle precedes its tool events; segments pair step/start with ste
   const messageFirst = events.findIndex((e) => e.type === "assistant/message");
   const toolCall = events.findIndex((e) => e.type === "tool/call");
   expect(messageFirst).toBeLessThan(toolCall);
-  // 段号从 claimStep 取，两段 2/3；段内 message 的 step 与段一致。
-  expect(events.filter((e) => e.type === "step/start").map((e) => e.data.step)).toEqual([2, 3]);
-  expect(events.filter((e) => e.type === "assistant/message").map((e) => e.data.step)).toEqual([2, 3]);
+  // 段号从 claimStep 取，第一段复用壳号 1，后续 2；段内 message 的 step 与段一致。
+  expect(events.filter((e) => e.type === "step/start").map((e) => e.data.step)).toEqual([1, 2]);
+  expect(events.filter((e) => e.type === "assistant/message").map((e) => e.data.step)).toEqual([1, 2]);
   // 段消息带本段的块（含 tool-call，stock 形态）。
   const firstMessage = events.find((e) => e.type === "assistant/message");
   expect(firstMessage.data.message.content.map((b) => b.type)).toEqual(["reasoning", "tool-call"]);
@@ -124,7 +140,7 @@ test("mixed usage shapes flatten per field", async () => {
   expect(message.data.usage).toEqual({ inputTokens: 5, outputTokens: 6, cacheReadTokens: 2 });
 });
 
-test("late tool result commits exactly once, at its call's step", async () => {
+test("segment end backfills unresolved calls; a late real result is dropped", async () => {
   const { events } = await run([
     { type: "tool-call", toolCallId: "c1", toolName: "bash", input: { command: "x" } },
     { type: "finish-step", finishReason: "tool-calls" },
@@ -135,6 +151,30 @@ test("late tool result commits exactly once, at its call's step", async () => {
     { type: "finish", finishReason: "stop" },
   ]);
   const results = events.filter((e) => e.type === "tool/result");
-  expect(results.map((e) => e.data.message.content[0].text)).toEqual(["real"]);
+  // 段尾必须补果（closeTools）；跨段真结果不可表示，由 reported 守卫丢弃。
+  expect(results.map((e) => e.data.message.content[0].text)).toEqual(["(no result)"]);
   expect(results[0].data.step).toBe(events.find((e) => e.type === "tool/call").data.step);
+});
+
+test("engine step shells are dropped; marked segment boundaries pass", () => {
+  const appended = [];
+  const sessionOf = (preset) => ({
+    seq: 1,
+    eventAt: () => ({ type: "agent-preset/selected", data: { agentPreset: preset } }),
+    append: (type, data) => { appended.push({ type, data }); return { seq: appended.length - 1 }; },
+  });
+  const agent = { session: sessionOf("claude-code") };
+  guardEngineStepBoundaries(agent);
+  agent.session.append("step/start", { turn: 1, step: 1 });
+  agent.session.append("step/end", { turn: 1, step: 1 });
+  agent.foreignSegmentBoundary = true;
+  agent.session.append("step/start", { turn: 1, step: 1 });
+  agent.foreignSegmentBoundary = false;
+  expect(appended.map((event) => event.type)).toEqual(["step/start"]);
+
+  // stock preset 的 step 边界必须原样落盘。
+  const stock = { session: sessionOf("stock") };
+  guardEngineStepBoundaries(stock);
+  stock.session.append("step/start", { turn: 1, step: 1 });
+  expect(appended.map((event) => event.type)).toEqual(["step/start", "step/start"]);
 });

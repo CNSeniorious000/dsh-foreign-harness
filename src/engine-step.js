@@ -162,14 +162,18 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   let attempt = null;
   /** 段内攒下的工具事件（到达序）：tool/call+tool/result 在段消息 settle 之后统一落。 */
   const segEvents = [];
+  /** 段边界要穿过 agent.session.append 的 shell 过滤器：标记后 append，落盘后立即复位。 */
+  const appendSegmentBoundary = (type, step) => {
+    agent.foreignSegmentBoundary = true;
+    try { return session.append(type, { turn, step }); } finally { agent.foreignSegmentBoundary = false; }
+  };
   // 段只在产出到达时存在（块或工具事件）——finish/finish-step/start-step/raw 等控制件不会开出空 step。
   const ensureSegment = () => {
     if (attempt !== null) return;
-    // 段号从 loop 的 step 账本上取（claimStep 前进一位）：loop 的 step/start+step/end 配对留给它
-    // 自己的 step 号，段自带完整的 start/end 配对——复用 loop 的号会让 step/end 被双关（日志直接
-    // corrupt：step/end does not match an open turn and step）。
+    // 段号从 loop 的 step 账本上取：第一段复用 loop 刚分配的壳号（壳的 start/end 已被 append 过滤器丢弃），
+    // 后续段递增，整条日志是顺序的顶级 step——step 不能嵌套，released 格式校验会拒绝。
     const segStep = claimStep();
-    session.append("step/start", { turn, step: segStep });
+    appendSegmentBoundary("step/start", segStep);
     attempt = new EngineStreamAttempt({
       sessionId: session.id,
       attempt: (agent.foreignAttempt = (agent.foreignAttempt ?? 0) + 1),
@@ -197,10 +201,13 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     const call = callSeqs.get(callId);
     if (call === undefined || reported.has(callId)) return;
     reported.add(callId);
-    const seq = session.append("tool/result", { turn, step: call.step, message: createToolResultMessage({ callId, content: [{ type: "text", text }], isError }) }, { surfaceOp: "append", sourceEventSeqs: [call.seq] }).seq;
-    dbg({ event: "tool/result", seq, turn, step: call.step });
+    // tool/result 必须落在当前 open step（format 的 requireStep）；同段时与 call.step 相同，回合末兜底时退回 call.step。
+    const step = attempt?.step ?? call.step;
+    const seq = session.append("tool/result", { turn, step, message: createToolResultMessage({ callId, content: [{ type: "text", text }], isError }) }, { surfaceOp: "append", sourceEventSeqs: [call.seq] }).seq;
+    dbg({ event: "tool/result", seq, turn, step });
   };
-  /** 已调用但没回报的补一个终止结果，否则卡片永远停在「运行中」。turn 收尾才补：段间迟到的真结果不该被占位顶掉成双果。 */
+  /** 已调用但没回报的补一个终止结果，否则卡片永远停在「运行中」。段尾必须补：step/end 的 closeTools 拒绝未决 call；
+   * 跨段真结果在 dsh 日志里不可表示（tool/result 只能落在自己的 open step），迟到的真结果由 reported 守卫丢弃。 */
   const backfillMissingResults = () => { for (const callId of callSeqs.keys()) commitToolResult(callId, "(no result)", true); };
 
   // 流翻译的块索引账本（per attempt，段切换时重置）：harness 的部件 id → dsh 的块序号与缓冲。
@@ -244,7 +251,8 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       else commitToolResult(event.callId, event.text, event.isError);
     }
     segEvents.length = 0;
-    session.append("step/end", { turn, step: attempt.step });
+    backfillMissingResults();
+    appendSegmentBoundary("step/end", attempt.step);
     dbg({ event: "segment/end", turn, step: attempt.step });
     open.clear(); // 块台账只活在本段：留着的话，段尾后迟到的 delta/end 会拿陈旧 entry 打到 null attempt
     attempt = null;

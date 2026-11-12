@@ -25,9 +25,19 @@ export function engineOfSession(session) {
   return ENGINES.has(env) ? env : undefined;
 }
 
+/** 引擎回合的段要成为顺序的顶级 step：丢弃 stock turn() 在 step() 前后发的未标记 shell 边界。 */
+export function guardEngineStepBoundaries(agent) {
+  const append = agent.session.append.bind(agent.session);
+  agent.session.append = (type, data, options) => {
+    if ((type === "step/start" || type === "step/end") && agent.foreignSegmentBoundary !== true && engineOfSession(agent.session) !== undefined) return undefined;
+    return append(type, data, options);
+  };
+}
+
 /** 把一个 stock agent 的 step() 换成引擎路由；handle.dispose 时顺带停引擎会话。 */
 function patchAgent(serviceCtx, ownerCtx, handle, settingsOf) {
   const agent = handle.agent;
+  guardEngineStepBoundaries(agent);
   const stockStep = agent.step.bind(agent);
   agent.step = async function (decision) {
     const engine = engineOfSession(this.session);
@@ -35,7 +45,7 @@ function patchAgent(serviceCtx, ownerCtx, handle, settingsOf) {
     const signal = this.phase.abort.signal;
     try {
       // 设置项是 volatile 活配置：每 step 现读，别在创建时冻进闭包。
-      return await runEngineStep(this, decision, { turn: this.phase.turn, signal, engine, settings: settingsOf(), ctx: serviceCtx, claimStep: () => ++this.phase.step });
+      return await runEngineStep(this, decision, { turn: this.phase.turn, signal, engine, settings: settingsOf(), ctx: serviceCtx, claimStep: () => this.phase.step++ });
     } finally {
       await decision.toolSet?.dispose?.();
     }
