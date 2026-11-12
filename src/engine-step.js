@@ -46,10 +46,11 @@ function historyTextOf(session, excludeIds) {
   return parts.join("\n\n");
 }
 
-function lastStateOf(session) {
+/** 只取指定引擎的记录；不传 engine 时取最后一条（写记录时的 no-op 比较用）。 */
+function lastStateOf(session, engine) {
   for (let seq = session.seq - 1; seq >= 0; seq--) {
     const record = pluginRecordOf(session.eventAt(seq));
-    if (record?.type === STATE_RECORD) return record.data;
+    if (record?.type === STATE_RECORD && (engine === undefined || record.data?.engine === engine)) return record.data;
   }
   return undefined;
 }
@@ -58,8 +59,8 @@ function lastStateOf(session) {
 async function engineSessionOf(agent, engine, settings, authEnv, model) {
   const cached = agent.foreignEngineSession;
   if (cached?.engine === engine) return cached;
-  if (cached !== undefined) await cached.handle.destroy();
-  const state = lastStateOf(agent.session);
+  if (cached !== undefined) { await cached.handle.destroy(); agent.foreignEngineSession = undefined; }
+  const state = lastStateOf(agent.session, engine);
   const handle = await createHarnessSession({
     engine,
     cwd: agent.session.header?.cwd ?? process.cwd(),
@@ -69,7 +70,8 @@ async function engineSessionOf(agent, engine, settings, authEnv, model) {
     sessionId: state?.sessionId ?? `${agent.session.id}:${engine}`,
     ...(state?.resumeFrom === undefined ? {} : { resumeFrom: state.resumeFrom }),
   });
-  agent.foreignEngineSession = { engine, handle, fresh: state === undefined };
+  // 没有 resumeFrom 就是接不回原会话（哪怕有同引擎的元数据记录，例如记录写失败只剩 sessionId）。
+  agent.foreignEngineSession = { engine, handle, fresh: state?.resumeFrom === undefined };
   return agent.foreignEngineSession;
 }
 
