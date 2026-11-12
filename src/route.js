@@ -28,8 +28,10 @@ export async function engineRoute(ctx, agent, engine, settings) {
   const profile = providerProfile(ctx, selection?.provider);
   const keyRef = profile?.apiKeyEnv;
   // 和 dsh-llm-pi-ai 的 resolveApiKey 同一条解析链：credentials（存储优先于环境）→ launchEnvironment 兜底。
+  // 存储读失败不炸回合，按「未配置」落回下一级（空值同义）。
   const credentials = ctx.get("credentials");
-  const storedKey = keyRef === undefined ? undefined : (await credentials?.resolve?.(keyRef))?.value ?? launchEnvironmentOf(ctx).get(keyRef)?.value;
+  const resolved = await Promise.resolve(keyRef === undefined ? undefined : credentials?.resolve?.(keyRef)).catch(() => undefined);
+  const storedKey = resolved?.value || (keyRef === undefined ? undefined : launchEnvironmentOf(ctx).get(keyRef)?.value);
 
   // 模型语义：dsh 里选的那个就是引擎用的那个（设置项是显式覆盖）；codex 沿用自己的模型体系。
   const model = engine === "codex"
@@ -39,7 +41,8 @@ export async function engineRoute(ctx, agent, engine, settings) {
   const env = {};
   for (const [key, value] of Object.entries(process.env)) if (key.startsWith("ANTHROPIC_") && value) env[key] = value;
   if (engine === "claude-code") {
-    const apiKey = settings.anthropicApiKey ?? storedKey;
+    // 空字符串视同未配置（credentials seam 同一口径），继续落回下一级。
+    const apiKey = settings.anthropicApiKey || storedKey || undefined;
     Object.assign(env, defined({
       ANTHROPIC_BASE_URL: settings.anthropicBaseUrl ?? profile?.baseURL,
       ANTHROPIC_MODEL: model,

@@ -1,6 +1,7 @@
 // 一个引擎回合：把这轮的用户消息交给 harness 引擎跑完整回合（工具循环在引擎内部），
 // 流事件实时翻译成 dsh 的 StreamChunk 走 agent/assistant-stream 帧（UI 边跑边渲染），
 // 终局落成 durable 事件：assistant/message（带紧凑 stream）+ tool/call + tool/result。
+import { appendFileSync } from "node:fs";
 import { createAssistantMessage, createToolResultMessage, fileHandleText, textOnlyImageText } from "@deepseek-ai/dsh-llm";
 import { appendPluginRecord, pluginRecordOf } from "@deepseek-ai/dsh-session";
 import { createHarnessSession } from "./harness.js";
@@ -76,17 +77,22 @@ async function engineSessionOf(agent, engine, settings, authEnv, model) {
  * （写缓冲只在请求边界 drain）。
  */
 async function rememberEngineState(ctx, agent, engine, engineSession, llm, cliIdHint) {
-  const cliId = await engineCliId(engineSession.handle.sessionId, cliIdHint);
-  if (cliId === undefined) return;
-  const state = {
-    engine,
-    sessionId: engineSession.handle.sessionId,
-    ...(llm === undefined ? {} : { llm }),
-    resumeFrom: { type: "resume-session", harnessId: engine, specificationVersion: "harness-v1", data: engine === "codex" ? { threadId: cliId } : { claudeSessionId: cliId } },
-  };
-  if (JSON.stringify(lastStateOf(agent.session)) === JSON.stringify(state)) return;
-  appendPluginRecord(agent.session, STATE_RECORD, state);
-  await ctx.get("sessions")?.flush?.(agent.session)?.catch?.(() => {});
+  // 元数据持久化是尽力而为：它绝不能把真实回合错误顶掉，也不能让成功回合的产出不落盘。
+  try {
+    const cliId = await engineCliId(engineSession.handle.sessionId, cliIdHint);
+    if (cliId === undefined) return;
+    const state = {
+      engine,
+      sessionId: engineSession.handle.sessionId,
+      ...(llm === undefined ? {} : { llm }),
+      resumeFrom: { type: "resume-session", harnessId: engine, specificationVersion: "harness-v1", data: engine === "codex" ? { threadId: cliId } : { claudeSessionId: cliId } },
+    };
+    if (JSON.stringify(lastStateOf(agent.session)) === JSON.stringify(state)) return;
+    appendPluginRecord(agent.session, STATE_RECORD, state);
+    await ctx.get("sessions")?.flush?.(agent.session)?.catch?.(() => {});
+  } catch (error) {
+    console.warn(`foreign-harness: cannot persist engine state record: ${String(error)}`);
+  }
 }
 
 /** teardown 时停掉引擎会话（记录已在每回合落过；resume state 的事实源在引擎自己的存储里）。 */
@@ -119,10 +125,9 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   const route = await engineRoute(ctx, agent, engine, settings);
   const engineSession = await engineSessionOf(agent, engine, settings, route.authEnv, route.model);
   const prompt = promptOf(decision.messages);
-  // 引擎会话全新（接不回原对话）才摊历史兜底，且只摊这一次——之后上下文在引擎自己手里，再喂就重复了。
+  // 引擎会话全新（接不回原对话）才摊历史兜底，且只摊一次（回合成功才消费，失败重试还要重喂）。
   let context = "";
   if (engineSession.fresh) {
-    engineSession.fresh = false;
     context = historyTextOf(session, new Set(decision.messages.map((message) => message.id)));
   }
   const input = context === "" ? prompt : `${context}\n\n（以上是此前的对话记录。下面是用户的新消息。）\n\n${prompt}`;
@@ -159,6 +164,7 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
 
   let usage;
   let cliIdHint;
+  let debugSeq = 0;
   let finishReason = { kind: "stop" };
   const takeUsage = (raw) => {
     usage = defined({
@@ -171,6 +177,13 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   };
 
   const translate = (part) => {
+    // 诊断通道：DSH_FH_DEBUG=<path> 时把引擎流部件的形态按序落盘（字段名/大小，不含正文）。
+    if (process.env.DSH_FH_DEBUG) {
+      const shape = { i: debugSeq++, type: part.type, keys: Object.keys(part).sort() };
+      for (const key of ["id", "toolCallId", "toolName", "finishReason"]) if (part[key] !== undefined) shape[key] = part[key];
+      for (const key of ["text", "delta", "input", "output", "error"]) if (part[key] !== undefined) shape[key + "Len"] = JSON.stringify(part[key])?.length;
+      appendFileSync(process.env.DSH_FH_DEBUG, JSON.stringify(shape) + "\n");
+    }
     if (part.type === "text-start") openBlock(part.id, "text");
     if (part.type === "text-delta") {
       const entry = open.get(part.id) ?? openBlock(part.id, "text");
@@ -245,6 +258,7 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   try {
     attempt.start();
     await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
+    engineSession.fresh = false;
   } catch (error) {
     // 中断/失败也把可见产出落盘（stock 同款 interrupted），否则界面上这轮凭空消失。
     const content = signal.aborted ? attempt.interruptedBlocks() : [];

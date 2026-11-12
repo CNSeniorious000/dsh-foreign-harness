@@ -1,10 +1,11 @@
 // dsh ↔ Codex 的会话归档同步：全事件驱动（不轮询），引擎即事实源（single source of truth）。
 // Codex 的归档物理事实 = rollout-*.jsonl 住在哪边：~/.codex/archived_sessions/ = 已归档（旧的会被压成
-// .jsonl.zst），~/.codex/sessions/YYYY/MM/DD/ = 未归档；文件名尾缀就是 threadId。watch 两侧目录的
-// rename 事件即可。dsh 侧不养第二份状态：启动时把引擎事实投影进 workspaceRegistry，dsh 上的归档操作
-// 则写穿 `codex archive`——两边都走原生入口，dsh 的归档闸门（agent/pre-step、session-stop）和 Codex
-// 自己的搬迁流程才都会正常触发。映射不持久化：~/.ai-sdk-harness/.agent-runs/<harnessSessionId>/bridge/
-// event-log.ndjson 的 `bridge-thread` 事件就是 threadId，目录名就是 harness sessionId（`<dshSessionId>:codex`）。
+// .jsonl.zst），~/.codex/sessions/YYYY/MM/DD/ = 未归档；文件名尾缀就是 threadId。watch ~/.codex 的
+// rename 事件即可，归档事实每次对齐现读磁盘（不维护内存镜像，天然没有 TOCTOU）。dsh 侧不养第二份状态：
+// dsh 上的归档操作写穿 `codex archive`，Codex 侧的搬家投影回 workspaceRegistry——两边都走原生入口，
+// dsh 的归档闸门（agent/pre-step、session-stop）和 Codex 自己的搬迁流程才都会正常触发。映射不持久化：
+// ~/.ai-sdk-harness/.agent-runs/<harnessSessionId>/bridge/event-log.ndjson 的 `bridge-thread` 事件就是
+// threadId，目录名就是 harness sessionId（`<dshSessionId>:codex`）。
 // Claude Code 本地会话的归档落点另行处理（见 README）。
 import { execFile } from "node:child_process";
 import { watch } from "node:fs";
@@ -14,7 +15,6 @@ import { basename, join } from "node:path";
 
 const RUNS_DIR = join(homedir(), ".ai-sdk-harness", ".agent-runs");
 const CODEX_ARCHIVED_DIR = join(homedir(), ".codex", "archived_sessions");
-const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 
 const exec = (file, args) => new Promise((ok) => execFile(file, args, { timeout: 15_000 }, (error) => ok(error === null)));
 
@@ -31,10 +31,8 @@ const ROLLOUT_THREAD = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 /** rollout 文件名尾缀即 threadId（.zst 是归档后压缩的旧文件）。 */
 export const threadOfRollout = (name) => basename(String(name)).match(ROLLOUT_THREAD)?.[1];
 
-const CLAUDE_SESSION = /"harnessMetadata":\{"claude-code":\{[^{}]*"sessionId":"([^"]+)"/;
-
-/** 引擎侧会话 id：codex 是 bridge-thread 事件的 threadId（取最后一次，重启过就换线程），
- * claude-code 是 finish 事件 harnessMetadata 里的 sessionId。尺寸没变就用缓存。 */
+/** 引擎侧会话 id：codex 是 bridge-thread 事件的 threadId，claude-code 是 finish 事件 harnessMetadata
+ * 里的 sessionId——都取最后一次（会话可能换过线程/重启过）。尺寸没变就用缓存。 */
 async function cliIdsOf(name, cache) {
   const path = join(RUNS_DIR, name, "bridge", "event-log.ndjson");
   const info = await stat(path).catch(() => undefined);
@@ -45,7 +43,9 @@ async function cliIdsOf(name, cache) {
   if (text === undefined) return {};
   let threadId;
   for (const match of text.matchAll(/"type":"bridge-thread","threadId":"([^"]+)"/g)) threadId = match[1];
-  const ids = { threadId, claudeSessionId: text.match(CLAUDE_SESSION)?.[1] };
+  let claudeSessionId;
+  for (const match of text.matchAll(/"harnessMetadata":\{"claude-code":\{[^{}]*"sessionId":"([^"]+)"/g)) claudeSessionId = match[1];
+  const ids = { threadId, claudeSessionId };
   cache.set(name, { size: info.size, ids });
   return ids;
 }
@@ -71,9 +71,19 @@ async function codexThreadMap(cache) {
   return map;
 }
 
+/** archived_sessions 里现存的 threadId 集（文件名尾缀）——归档事实的唯一读口。 */
+async function archivedThreadIds() {
+  const ids = new Set();
+  for (const name of await readdir(CODEX_ARCHIVED_DIR).catch(() => [])) {
+    const threadId = threadOfRollout(name);
+    if (threadId !== undefined) ids.add(threadId);
+  }
+  return ids;
+}
+
 /**
- * 启动归档同步：引擎事实先投影进 dsh（启动即对齐），之后全靠事件——
- * rollout 文件搬家（Codex 侧）或 workspace 归档集变化（dsh 侧）各推对侧。
+ * 启动归档同步：启动只建基线（历史分歧不追溯翻转），之后全靠事件——rollout 文件搬家（Codex 侧）
+ * 或 workspace 归档集变化（dsh 侧）各推对侧。
  * @param {object} ctx 插件服务上下文（要拿得到 workspaceRegistry）
  * @returns {() => void} 停止函数（挂在 ctx.effect 上）
  */
@@ -84,28 +94,33 @@ export function startArchiveSync(ctx) {
   const cache = new Map();
   /** @type {Map<string, { dsh: boolean | undefined, codex: boolean | undefined }>} threadId → 两侧上次值 */
   const prev = new Map();
-  /** 归档事实（引擎侧）：住在 archived_sessions 的 threadId。watch 事件维护。 */
-  let archivedIds = new Set();
 
-  /** 批量对齐：pairs = [[threadId, dshId], ...]，单侧变化往另一侧推。串行链防并发批次交错。 */
+  // 串行链：任何一节抛错都放行下一节，否则一次异常就让同步永久静默死掉。
   let chain = Promise.resolve();
-  const reconcile = (pairs) => (chain = chain.then(async () => {
+  const later = (job) => (chain = chain.then(job, job));
+
+  /** 批量对齐：pairs = [[threadId, dshId], ...]，单侧变化往另一侧推。 */
+  const reconcile = (pairs) => later(async () => {
+    const truth = await archivedThreadIds();
     const dshNow = new Set(registry.archivedSessionIds.map(String));
     for (const [threadId, dshId] of pairs) {
-      const codex = archivedIds.has(threadId);
+      const codex = truth.has(threadId);
       const dsh = dshNow.has(dshId);
       const last = prev.get(threadId) ?? {};
       const plan = syncPlan(last.dsh, last.codex, dsh, codex);
-      // 推送成功就乐观更新那一侧：否则自己写入的回声会被当成「对方也动了」而双双跳过。
+      // 推送成功就记目标值（= 对侧现值，可能本来就已到位，不能用 !x 猜翻转）；失败不写基线，下次事件重试。
       let wroteDsh = false;
       let wroteCodex = false;
       if (plan === "archive-codex" || plan === "unarchive-codex") wroteCodex = await exec("codex", [plan === "archive-codex" ? "archive" : "unarchive", threadId]);
       if (plan === "archive-dsh") wroteDsh = await registry.archiveSession(dshId, { stopActivity: true }).then(() => true, () => false);
       if (plan === "unarchive-dsh") wroteDsh = await registry.unarchiveSession(dshId).then(() => true, () => false);
-      // 推送目标就是对侧的现值（可能本来就已到位）——不能用 !x 猜翻转，会把基线写反。
+      if (plan !== undefined && !wroteDsh && !wroteCodex) {
+        ctx.logger.warn(`foreign-harness: archive sync ${plan} failed for ${threadId} / ${dshId}, will retry on next change`);
+        continue;
+      }
       prev.set(threadId, { dsh: wroteDsh ? codex : dsh, codex: wroteCodex ? dsh : codex });
     }
-  }));
+  });
 
   // Codex → dsh：rollout 文件搬进/搬出 archived_sessions。一次搬家会来两个 rename 事件，攒 100ms 批处理。
   const pending = new Set();
@@ -122,21 +137,16 @@ export function startArchiveSync(ctx) {
       })();
     }, 100);
   };
-  const onRollout = (inArchived) => (event, filename) => {
+  const onRollout = (event, filename) => {
     if (event !== "rename" || filename == null) return;
     const threadId = threadOfRollout(filename);
-    if (threadId === undefined) return;
-    void (async () => {
-      const path = join(inArchived ? CODEX_ARCHIVED_DIR : CODEX_SESSIONS_DIR, String(filename));
-      const alive = await stat(path).then(() => true, () => false);
-      if (!alive) return;
-      if (inArchived) archivedIds.add(threadId); else archivedIds.delete(threadId);
-      queue(threadId);
-    })();
+    if (threadId !== undefined) queue(threadId);
   };
-  const watchers = [];
-  try { watchers.push(watch(CODEX_ARCHIVED_DIR, onRollout(true))); } catch {}
-  try { watchers.push(watch(CODEX_SESSIONS_DIR, { recursive: true }, onRollout(false))); } catch {}
+  // 单个 ~/.codex 递归 watch：两侧目录缺一个（新机器没归档过）也不失明。
+  let watcher;
+  try { watcher = watch(join(homedir(), ".codex"), { recursive: true }, onRollout); } catch (error) {
+    ctx.logger.warn(`foreign-harness: cannot watch ~/.codex, codex → dsh archive sync is disabled: ${String(error)}`);
+  }
 
   // dsh → Codex：workspace 归档集变化（照抄 WorkspaceFeed 的触发口径）。
   const off = ctx.on("domain/changed", (change) => {
@@ -144,18 +154,14 @@ export function startArchiveSync(ctx) {
     void (async () => reconcile([...(await codexThreadMap(cache))]))();
   });
 
-  // 启动只建基线（引擎事实在 archivedIds/映射里，dsh 事实即 workspaceRegistry）：
-  // 历史分歧不追溯翻转——归档状态的事实源在引擎自己的存储里，dsh 这边只是投影/写穿，不养第二份。
-  void (async () => {
-    archivedIds = new Set();
-    for (const name of await readdir(CODEX_ARCHIVED_DIR).catch(() => [])) {
-      const threadId = threadOfRollout(name);
-      if (threadId !== undefined) archivedIds.add(threadId);
-    }
+  // 启动基线也走串行链：扫描期发生的变更排在它后面，不会被当历史分歧吞掉。
+  void later(async () => {
+    const truth = await archivedThreadIds();
+    const dshNow = new Set(registry.archivedSessionIds.map(String));
     for (const [threadId, dshId] of await codexThreadMap(cache)) {
-      prev.set(threadId, { dsh: registry.archivedSessionIds.some((id) => String(id) === dshId), codex: archivedIds.has(threadId) });
+      prev.set(threadId, { dsh: dshNow.has(dshId), codex: truth.has(threadId) });
     }
-  })();
+  });
 
-  return () => { off?.(); clearTimeout(flushTimer); for (const watcher of watchers) watcher.close(); };
+  return () => { off?.(); clearTimeout(flushTimer); watcher?.close(); };
 }
