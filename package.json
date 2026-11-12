@@ -17,14 +17,19 @@
     "./package.json": "./package.json"
   },
   "files": ["src", "locale/*.json"],
-  "engines": { "node": ">=18" },
-  "scripts": { "test": "bun test" },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
   "dependencies": {
     "@ai-sdk/harness": "^1.0.176",
     "@ai-sdk/harness-claude-code": "^1.0.180",
     "@ai-sdk/harness-codex": "^1.0.179",
     "@deepseek-ai/schemastery": "~3.19.0",
-    "ai": "^7.0.165"
+    "ai": "^7.0.165",
+    "shlex": "^3.0.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",

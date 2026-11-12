@@ -305,3 +305,17 @@ test("mcp tool names are shortened and semantic args lead the summary", async ()
   // deriveSummary 对 generic 取 args 首值——code 要排在 session_id 前，摘要才不是 uuid。
   expect(JSON.parse(call.data.arguments)).toEqual({ code: "print(1)", session_id: "d9ac5ed8-uuid" });
 });
+
+test("shell stripping is shape-based, not a shell whitelist", async () => {
+  const { events } = await run([
+    // 任意 shell 路径 + -c/-lc 都剥；python -c 这类不是 shell 壳，不碰。
+    { type: "tool-call", toolCallId: "c1", toolName: "shell", input: { command: "/opt/homebrew/bin/zsh -c 'echo a'" } },
+    { type: "tool-result", toolCallId: "c1", providerExecuted: true, output: "a" },
+    { type: "tool-call", toolCallId: "c2", toolName: "shell", input: { command: "python3 -c 'print(1)'" } },
+    { type: "tool-result", toolCallId: "c2", providerExecuted: true, output: "1" },
+    { type: "finish-step", finishReason: "stop" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  const commands = events.filter((e) => e.type === "tool/call").map((e) => JSON.parse(e.data.arguments).command);
+  expect(commands).toEqual(["echo a", "python3 -c 'print(1)'"]);
+});

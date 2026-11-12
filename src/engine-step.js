@@ -5,6 +5,7 @@
 // 与 stock「LLM 返回含 tool-call 的 message 后才 dispatch 工具」同形。折叠引擎落盘时按 settled.seq
 // 重建锚点（firstVisibleSeq 是瞬态），工具事件若先落，思考行会被挤到工具卡之后。
 import { appendFileSync } from "node:fs";
+import { split as shlexSplit } from "shlex";
 import { createAssistantMessage, createToolResultMessage, fileHandleText, textOnlyImageText } from "@deepseek-ai/dsh-llm";
 import { appendPluginRecord, pluginRecordOf } from "@deepseek-ai/dsh-session";
 import { createHarnessSession } from "./harness.js";
@@ -143,17 +144,22 @@ function prettyToolCall(name, args) {
   }
 }
 
-// Codex 的 command_execution 自带 `/bin/zsh -lc '…'` 壳（cli 用 login shell 跑命令）——剥掉壳，
-// 卡片和 input 面板显示真实命令。两种引号形态都要认；单引号壳里 shell 用 '"'"' 转义单引号。
+// Codex 的 shell 命令在内部是 argv `[shell_path, "-lc", command]`（core/src/shell.rs 的
+// derive_exec_args），app-server wire 上被 shlex join 成一个字符串（设计上 round-trippable）。
+// 用 shlex 词法还原 argv，按 Codex 自己的分类形状（classify_shell_name：shell 家族 + -c 族旗标）
+// 剥掉壳——引号/转义交给词法器，不 hard-code shell 路径。
+const SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ksh", "tcsh", "csh"]);
 function stripShellWrapper(args) {
   try {
     const parsed = JSON.parse(args);
     const raw = parsed?.command;
     if (typeof raw !== "string") return args;
-    const match = raw.match(/^(?:\/bin\/)?(?:zsh|bash|sh) -l?c (["'])([\s\S]*)\1$/);
-    if (match === null) return args;
-    parsed.command = match[1] === "'" ? match[2].replaceAll("'\"'\"'", "'") : match[2].replaceAll('\\"', '"');
-    return JSON.stringify(parsed);
+    const argv = shlexSplit(raw);
+    if (argv.length === 3 && SHELL_NAMES.has(argv[0].split("/").pop()) && /^-l?c$/.test(argv[1])) {
+      parsed.command = argv[2];
+      return JSON.stringify(parsed);
+    }
+    return args;
   } catch {
     return args;
   }
