@@ -119,11 +119,9 @@ const finishKindOf = (reason) => {
 // 整个对象当 token 数存进 durable message（UI 读数直接坏）。
 const normalizeUsage = (raw) => {
   const nested = typeof raw.inputTokens === "object" && raw.inputTokens !== null;
-  const input = nested ? raw.inputTokens?.total : raw.inputTokens;
-  const output = typeof raw.outputTokens === "object" && raw.outputTokens !== null ? raw.outputTokens?.total : raw.outputTokens;
   return defined({
-    inputTokens: input ?? 0,
-    outputTokens: output ?? 0,
+    inputTokens: (nested ? raw.inputTokens.total : raw.inputTokens) ?? 0,
+    outputTokens: (nested ? raw.outputTokens?.total : raw.outputTokens) ?? 0,
     totalTokens: raw.totalTokens,
     cacheReadTokens: nested ? raw.inputTokens?.cacheRead : raw.inputTokenDetails?.cacheReadTokens,
     cacheWriteTokens: nested ? raw.inputTokens?.cacheWrite : raw.inputTokenDetails?.cacheWriteTokens,
@@ -135,9 +133,9 @@ const normalizeUsage = (raw) => {
  * 失败/中断先落可见产出再抛。decision.messages 会像 stock 一样落成 user/message。
  * @param {object} agent stock machine（有 session/model/dispatch/phase）
  * @param {{ messages: readonly object[], toolSet?: { dispose?: () => void } }} decision
- * @param {{ turn: number, step: number, signal: AbortSignal, engine: string, settings: object, ctx: object }} context
+ * @param {{ turn: number, signal: AbortSignal, engine: string, settings: object, ctx: object, claimStep: () => number }} context
  */
-export async function runEngineStep(agent, decision, { turn, step, signal, engine, settings, ctx }) {
+export async function runEngineStep(agent, decision, { turn, signal, engine, settings, ctx, claimStep }) {
   const session = agent.session;
   for (const message of decision.messages) session.append("user/message", message, { surfaceOp: "append" });
 
@@ -158,13 +156,32 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
 
   // 每个引擎内部 step 是一个「段」：独立 attempt（独立折叠上下文 turn:step），段消息 settle 后才落
   // 该段的工具事件（锚序 = stock 形态），段尾 step/end 把 retained 流帧退役掉（否则下一段 attempt 的
-  // start 帧触发 rebaseline）。段 0 复用 loop 的 step/start；后续段用 step+k 自带 start/end。
-  let segIndex = 0;
+  // start 帧触发 rebaseline）。每个段自带 step/start+step/end 配对。
   /** @type {EngineStreamAttempt | null} 当前段的流 attempt（null = 无活跃段） */
   let attempt = null;
-  let segUsage;
   /** 段内攒下的工具事件（到达序）：tool/call+tool/result 在段消息 settle 之后统一落。 */
   const segEvents = [];
+  // 段只在产出到达时存在（块或工具事件）——finish/finish-step/start-step/raw 等控制件不会开出空 step。
+  const ensureSegment = () => {
+    if (attempt !== null) return;
+    // 段号从 loop 的 step 账本上取（claimStep 前进一位）：loop 的 step/start+step/end 配对留给它
+    // 自己的 step 号，段自带完整的 start/end 配对——复用 loop 的号会让 step/end 被双关（日志直接
+    // corrupt：step/end does not match an open turn and step）。
+    const segStep = claimStep();
+    session.append("step/start", { turn, step: segStep });
+    attempt = new EngineStreamAttempt({
+      sessionId: session.id,
+      attempt: (agent.foreignAttempt = (agent.foreignAttempt ?? 0) + 1),
+      turn,
+      step: segStep,
+      nextRevision: () => (agent.foreignRevision = (agent.foreignRevision ?? 0) + 1),
+      emit: (frame) => agent.dispatch.emit("agent/assistant-stream", { frame }),
+    });
+    attempt.start();
+    index = 0;
+    open.clear();
+    dbg({ event: "segment/start", turn, step: segStep });
+  };
   /** @type {Map<string, number>} callId → tool/call 事件 seq（tool/result 回指用） */
   const callSeqs = new Map();
   const reported = new Set();
@@ -187,6 +204,7 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   let index = 0;
   const open = new Map();
   const openBlock = (id, kind, extra) => {
+    ensureSegment();
     const entry = { index: index++, kind, buffer: "", args: "", ...extra };
     open.set(id, entry);
     attempt.push({ type: "block-start", index: entry.index, blockType: kind === "tool" ? "tool-call" : kind });
@@ -198,42 +216,25 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
     open.delete(id);
     attempt.push({ type: "block-end", index: entry.index, block });
   };
-
-  const beginSegment = () => {
-    // 段从 step+1 起号：loop 会给本 step 发 step/start+step/end 配对（空壳、无内容不渲染），
-    // 段自带完整的 start/end 配对——复用 loop 的 step 号会让 step/end 被双关（日志直接 corrupt：
-    // step/end does not match an open turn and step）。
-    const segStep = step + 1 + segIndex++;
-    session.append("step/start", { turn, step: segStep });
-    attempt = new EngineStreamAttempt({
-      sessionId: session.id,
-      attempt: (agent.foreignAttempt = (agent.foreignAttempt ?? 0) + 1),
-      turn,
-      step: segStep,
-      nextRevision: () => (agent.foreignRevision = (agent.foreignRevision ?? 0) + 1),
-      emit: (frame) => agent.dispatch.emit("agent/assistant-stream", { frame }),
-    });
-    attempt.start();
-    index = 0;
-    open.clear();
-    dbg({ event: "segment/start", turn, step: segStep });
+  const bufferSegEvent = (event) => {
+    ensureSegment();
+    segEvents.push(event);
   };
 
   /** 段收尾：finish 帧 → settle 段消息 → 落工具事件 → 补无果调用 → step/end 退役 retained 流帧。 */
-  const finishSegment = ({ reason, mode = "normal" }) => {
-    const current = attempt;
-    if (segUsage !== undefined) current.push({ type: "usage", usage: segUsage });
-    current.push({ type: "finish", reason: reason ?? { kind: "stop" } });
+  const finishSegment = ({ reason, usage, mode = "normal" }) => {
+    if (usage !== undefined) attempt.push({ type: "usage", usage });
+    attempt.push({ type: "finish", reason });
     // 空文本/空思考块不落（codex 会发 reasoning-start/end 零 delta 的空思考），UI 靠块渲染卡片。
-    const content = (mode === "interrupted" ? current.interruptedBlocks() : mode === "failed" ? [] : current.blocks()).filter((block) => (block.type !== "text" && block.type !== "reasoning") || block.text.trim() !== "");
+    const content = (mode === "interrupted" ? attempt.interruptedBlocks() : mode === "failed" ? [] : attempt.blocks()).filter((block) => (block.type !== "text" && block.type !== "reasoning") || block.text.trim() !== "");
     if (content.length > 0) {
-      current.settle("assistant/message", () => {
-        const seq = session.append("assistant/message", { turn, step: current.step, message: createAssistantMessage({ content, source }), stream: current.stream, ...(mode === "interrupted" ? { interrupted: true } : {}), ...(segUsage === undefined ? {} : { usage: segUsage }) }, { surfaceOp: "append" }).seq;
-        dbg({ event: "assistant/message", seq, turn, step: current.step });
+      attempt.settle("assistant/message", () => {
+        const seq = session.append("assistant/message", { turn, step: attempt.step, message: createAssistantMessage({ content, source }), stream: attempt.stream, ...(mode === "interrupted" ? { interrupted: true } : {}), ...(usage === undefined ? {} : { usage }) }, { surfaceOp: "append" }).seq;
+        dbg({ event: "assistant/message", seq, turn, step: attempt.step });
         return seq;
       });
-    } else if (!current.ended) {
-      current.settle("assistant/attempt", () => session.append("assistant/attempt", { turn, step: current.step, stream: current.stream }).seq);
+    } else if (!attempt.ended) {
+      attempt.settle("assistant/attempt", () => session.append("assistant/attempt", { turn, step: attempt.step, stream: attempt.stream }).seq);
     }
     for (const event of segEvents) {
       if (event.kind === "call") dispatchToolCall(event.callId, event.name, event.args);
@@ -242,10 +243,9 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
     segEvents.length = 0;
     // 已调用但没回报的补一个终止结果，否则卡片永远停在「运行中」。
     for (const callId of callSeqs.keys()) if (!reported.has(callId)) commitToolResult(callId, "(no result)", true);
-    session.append("step/end", { turn, step: current.step });
-    dbg({ event: "segment/end", turn, step: current.step });
+    session.append("step/end", { turn, step: attempt.step });
+    dbg({ event: "segment/end", turn, step: attempt.step });
     attempt = null;
-    segUsage = undefined;
   };
 
   let cliIdHint;
@@ -260,9 +260,6 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
       for (const key of ["text", "delta", "input", "output", "error"]) if (part[key] !== undefined) shape[key + "Len"] = JSON.stringify(part[key])?.length;
       appendFileSync(process.env.DSH_FH_DEBUG, JSON.stringify(shape) + "\n");
     }
-    // 只有产出部件才建段：finish/finish-step/start-step/raw 是控制件，回合末的 finish 会紧跟着
-    // 最后一个 finish-step 到达，跟着建段就是凭空多一个空 step。
-    if (attempt === null && part.type !== "finish" && part.type !== "finish-step" && part.type !== "start-step" && part.type !== "raw") beginSegment();
     if (part.type === "text-start") openBlock(part.id, "text");
     if (part.type === "text-delta") {
       const entry = open.get(part.id) ?? openBlock(part.id, "text");
@@ -315,20 +312,19 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
         }
         closeBlock(toolCallId, { type: "tool-call", id: toolCallId, name, arguments: entry.args });
       }
-      segEvents.push({ kind: "call", callId: toolCallId, name, args });
+      bufferSegEvent({ kind: "call", callId: toolCallId, name, args });
     }
     // 工具结果（引擎内部执行，providerExecuted 才是真结果）——先攒着，段消息 settle 后按到达序落。
     if ((part.type === "tool-result" || part.type === "tool-output-available") && part.providerExecuted) {
       const output = typeof part.output === "string" ? part.output : JSON.stringify(part.output) ?? "";
-      segEvents.push({ kind: "result", callId: part.toolCallId, text: output.slice(0, 8000), isError: false });
+      bufferSegEvent({ kind: "result", callId: part.toolCallId, text: output.slice(0, 8000), isError: false });
     }
     if ((part.type === "tool-error" || part.type === "tool-output-error") && part.providerExecuted) {
       const error = part.error ?? part.errorText;
-      segEvents.push({ kind: "result", callId: part.toolCallId, text: String(error?.message ?? error).slice(0, 8000), isError: true });
+      bufferSegEvent({ kind: "result", callId: part.toolCallId, text: String(error?.message ?? error).slice(0, 8000), isError: true });
     }
     if (part.type === "finish-step" && attempt !== null) {
-      if (part.usage !== undefined) segUsage = normalizeUsage(part.usage);
-      finishSegment({ reason: finishKindOf(part.finishReason) });
+      finishSegment({ reason: finishKindOf(part.finishReason), usage: part.usage === undefined ? undefined : normalizeUsage(part.usage) });
     }
     if (part.type === "finish") {
       finishReason = finishKindOf(part.finishReason);
@@ -338,16 +334,14 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   };
 
   try {
-    beginSegment();
     await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
     engineSession.fresh = false;
   } catch (error) {
     // 中断/失败也把可见产出落盘（stock 同款 interrupted），否则界面上这轮凭空消失。
-    if (attempt !== null && !attempt.ended) finishSegment({ reason: finishKindOf(signal.aborted ? "abort" : "error"), mode: signal.aborted ? "interrupted" : "failed" });
+    const aborted = signal.aborted;
+    if (attempt !== null && !attempt.ended) finishSegment({ reason: finishKindOf(aborted ? "abort" : "error"), mode: aborted ? "interrupted" : "failed" });
     throw error;
   } finally {
-    // 合成段占掉的 step 编号要记入 loop 的账本，否则下一个 stock step 撞号（同 turn:step 折叠成一个节点）。
-    if (segIndex > 0 && agent.phase !== undefined) agent.phase.step = Math.max(agent.phase.step ?? 0, step + segIndex);
     await rememberEngineState(ctx, agent, engine, engineSession, route.llm, cliIdHint);
   }
 

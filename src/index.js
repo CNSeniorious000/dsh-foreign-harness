@@ -35,7 +35,7 @@ function patchAgent(serviceCtx, ownerCtx, handle, settingsOf) {
     const signal = this.phase.abort.signal;
     try {
       // 设置项是 volatile 活配置：每 step 现读，别在创建时冻进闭包。
-      return await runEngineStep(this, decision, { turn: this.phase.turn, step: this.phase.step, signal, engine, settings: settingsOf(), ctx: serviceCtx });
+      return await runEngineStep(this, decision, { turn: this.phase.turn, signal, engine, settings: settingsOf(), ctx: serviceCtx, claimStep: () => ++this.phase.step });
     } finally {
       await decision.toolSet?.dispose?.();
     }
