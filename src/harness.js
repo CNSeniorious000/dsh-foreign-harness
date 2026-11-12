@@ -61,7 +61,14 @@ export async function createHarnessSession({ engine, cwd, settings, sessionId, r
     sandboxConfig: { workDir: "." },
     ...(resolvedModel === undefined ? {} : { model: resolvedModel }),
   });
-  const session = await agent.createSession({ sandboxSession: sandbox, ...(sessionId === undefined ? {} : { sessionId }), ...(resumeFrom === undefined ? {} : { resumeFrom }) });
+  let session;
+  try {
+    session = await agent.createSession({ sandboxSession: sandbox, ...(sessionId === undefined ? {} : { sessionId }), ...(resumeFrom === undefined ? {} : { resumeFrom }) });
+  } catch (error) {
+    // caller-provided sandbox 不归 harness 所有，createSession 失败时它不会自己销毁（bridge 可能已经拉起）。
+    await sandbox.destroy().catch(() => {});
+    throw error;
+  }
   return {
     sessionId: session.sessionId,
     async turn(prompt, { signal, onEvent, model: turnModel } = {}) {

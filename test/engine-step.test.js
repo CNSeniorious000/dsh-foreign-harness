@@ -6,14 +6,27 @@ import { restoreReleasedV4Artifact } from "@deepseek-ai/dsh-session-format-v3-to
 
 const parts = [];
 const calls = [];
+const creates = [];
+let failResume = false;
+let failTurns = 0;
+let throwAfterParts = false;
 mock.module("../src/harness.js", () => ({
   ENGINES: new Set(["claude-code", "codex"]),
-  createHarnessSession: async (options) => ({
-    sessionId: options?.sessionId ?? "harness-test",
-    turn: async (input, { onEvent }) => { calls.push({ options, input }); for (const part of parts) onEvent(part); },
-    destroy: async () => {},
-    stop: async () => {},
-  }),
+  createHarnessSession: async (options) => {
+    creates.push(options);
+    if (failResume && options?.resumeFrom !== undefined) { failResume = false; throw new Error("stale resume"); }
+    return {
+      sessionId: options?.sessionId ?? "harness-test",
+      turn: async (input, { onEvent }) => {
+        calls.push({ options, input });
+        if (failTurns > 0) { failTurns--; throw new Error("stale turn"); }
+        for (const part of parts) onEvent(part);
+        if (throwAfterParts) { throwAfterParts = false; throw new Error("after parts"); }
+      },
+      destroy: async () => {},
+      stop: async () => {},
+    };
+  },
 }));
 // mock.module 要先于被测模块加载（import 声明会提升），故动态 import。
 const { runEngineStep } = await import("../src/engine-step.js");
@@ -63,45 +76,91 @@ const assertReleasedLog = (events) => restoreReleasedV4Artifact({
   ].map((event, seq) => ({ ...event, seq, time: 0 })),
 }, KNOWN_SESSION_EVENT_TYPES);
 
+const state = (engine, resumeFrom) => ({ ignorable: true, type: "plugin:dsh-foreign-harness/state", data: { engine, sessionId: `${engine}-session`, ...resumeFrom === undefined ? {} : { resumeFrom } } });
+const resumeFrom = { type: "resume-session", harnessId: "claude-code", specificationVersion: "harness-v1", data: { claudeSessionId: "x" } };
+
+const runAs = async (engine, records) => {
+  calls.length = 0;
+  creates.length = 0;
+  const events = [];
+  const agent = makeAgent(events);
+  agent.session.seq = records.length;
+  agent.session.eventAt = (seq) => records[seq];
+  agent.session.deriveMessages = () => [{ id: "old", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "previous" }] }];
+  parts.splice(0, parts.length, { type: "finish", finishReason: "stop" });
+  const result = await runEngineStep(agent, { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }] }, {
+    turn: 1,
+    signal: new AbortController().signal,
+    engine,
+    settings: {},
+    ctx: { get: () => undefined },
+    claimStep: () => 1,
+  });
+  assertReleasedLog(events);
+  return { call: calls.at(-1), result };
+};
+
 test("engine state is scoped by engine; no resumeFrom means fresh with history", async () => {
-  const runAs = async (engine, records) => {
-    calls.length = 0;
-    const events = [];
-    const agent = makeAgent(events);
-    agent.session.seq = records.length;
-    agent.session.eventAt = (seq) => records[seq];
-    agent.session.deriveMessages = () => [{ id: "old", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "previous" }] }];
-    parts.splice(0, parts.length, { type: "finish", finishReason: "stop" });
-    await runEngineStep(agent, { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }] }, {
-      turn: 1,
-      signal: new AbortController().signal,
-      engine,
-      settings: {},
-      ctx: { get: () => undefined },
-      claimStep: () => 1,
-    });
-    assertReleasedLog(events);
-    return calls.at(-1);
-  };
-  const state = (engine, resumeFrom) => ({ ignorable: true, type: "plugin:dsh-foreign-harness/state", data: { engine, sessionId: `${engine}-session`, ...resumeFrom === undefined ? {} : { resumeFrom } } });
-  const resumeFrom = { type: "resume-session", harnessId: "claude-code", specificationVersion: "harness-v1", data: { claudeSessionId: "x" } };
 
   // 别的引擎的记录不能拿来续：换引擎必须 fresh 并喂历史。
   const switched = await runAs("codex", [state("claude-code", resumeFrom)]);
-  expect(switched.options.resumeFrom).toBeUndefined();
-  expect(switched.options.sessionId).toBe("s1:codex");
-  expect(switched.input).toContain("previous");
+  expect(switched.call.options.resumeFrom).toBeUndefined();
+  expect(switched.call.options.sessionId).toBe("s1:codex");
+  expect(switched.call.input).toContain("previous");
 
   // 同引擎但没有 resumeFrom：复用 sessionId，但历史仍要兜底。
   const noResume = await runAs("claude-code", [state("claude-code")]);
-  expect(noResume.options.resumeFrom).toBeUndefined();
-  expect(noResume.options.sessionId).toBe("claude-code-session");
-  expect(noResume.input).toContain("previous");
+  expect(noResume.call.options.resumeFrom).toBeUndefined();
+  expect(noResume.call.options.sessionId).toBe("claude-code-session");
+  expect(noResume.call.input).toContain("previous");
 
   // 同引擎且有 resumeFrom：续原会话，不重复喂历史。
   const resumed = await runAs("claude-code", [state("claude-code", resumeFrom)]);
-  expect(resumed.options.resumeFrom).toEqual(resumeFrom);
-  expect(resumed.input).toBe("hi");
+  expect(resumed.call.options.resumeFrom).toEqual(resumeFrom);
+  expect(resumed.call.input).toBe("hi");
+});
+
+test("a failed createSession resume retries once without resumeFrom", async () => {
+  failResume = true;
+  const attempted = await runAs("claude-code", [state("claude-code", resumeFrom)]);
+  expect(creates).toHaveLength(2);
+  expect(creates[0].resumeFrom).toEqual(resumeFrom);
+  expect(creates[1].resumeFrom).toBeUndefined();
+  expect(creates[1].sessionId).toBe(creates[0].sessionId);
+  expect(attempted.call.input).toContain("previous");
+});
+
+test("a zero-output turn failure retries fresh once and re-feeds history", async () => {
+  failTurns = 1;
+  const attempted = await runAs("claude-code", [state("claude-code", resumeFrom)]);
+  expect(creates).toHaveLength(2);
+  expect(calls).toHaveLength(2);
+  expect(calls[0].input).toBe("hi");
+  expect(creates[1].resumeFrom).toBeUndefined();
+  expect(creates[1].sessionId).toBe(creates[0].sessionId);
+  expect(calls[1].input).toContain("previous");
+  expect(attempted.result).toEqual({ kind: "completed" });
+});
+
+test("a turn that produced output is not retried", async () => {
+  throwAfterParts = true;
+  calls.length = 0;
+  creates.length = 0;
+  const events = [];
+  const agent = makeAgent(events);
+  agent.session.seq = 1;
+  agent.session.eventAt = () => state("claude-code", resumeFrom);
+  parts.splice(0, parts.length, { type: "text-start", id: "t1" }, { type: "text-delta", id: "t1", text: "partial" }, { type: "text-end", id: "t1" });
+  await expect(runEngineStep(agent, { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }] }, {
+    turn: 1,
+    signal: new AbortController().signal,
+    engine: "claude-code",
+    settings: {},
+    ctx: { get: () => undefined },
+    claimStep: () => 1,
+  })).rejects.toThrow("after parts");
+  expect(creates).toHaveLength(1);
+  assertReleasedLog(events);
 });
 
 test("segment settle precedes its tool events; segments pair step/start with step/end", async () => {

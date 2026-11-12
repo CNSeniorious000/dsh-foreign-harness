@@ -56,20 +56,30 @@ function lastStateOf(session, engine) {
 }
 
 /** 每个 dsh 会话一个引擎会话；引擎切换走新 sessionId，互不干扰。 */
-async function engineSessionOf(agent, engine, settings, authEnv, model) {
+async function engineSessionOf(agent, engine, settings, authEnv, model, { ignoreState = false, sessionId } = {}) {
   const cached = agent.foreignEngineSession;
   if (cached?.engine === engine) return cached;
   if (cached !== undefined) { await cached.handle.destroy(); agent.foreignEngineSession = undefined; }
-  const state = lastStateOf(agent.session, engine);
-  const handle = await createHarnessSession({
+  const state = ignoreState ? undefined : lastStateOf(agent.session, engine);
+  const base = {
     engine,
     cwd: agent.session.header?.cwd ?? process.cwd(),
     settings,
     ...(authEnv === undefined ? {} : { authEnv }),
     ...(model === undefined ? {} : { model }),
-    sessionId: state?.sessionId ?? `${agent.session.id}:${engine}`,
-    ...(state?.resumeFrom === undefined ? {} : { resumeFrom: state.resumeFrom }),
-  });
+    sessionId: sessionId ?? state?.sessionId ?? `${agent.session.id}:${engine}`,
+  };
+  let handle;
+  try {
+    handle = await createHarnessSession({ ...base, ...(state?.resumeFrom === undefined ? {} : { resumeFrom: state.resumeFrom }) });
+  } catch (error) {
+    if (state?.resumeFrom === undefined) throw error;
+    // createSession 层的续接失败（lifecycle 校验/schema）降级为新会话；stale 引擎会话的真实失败在 turn 层重试。
+    console.warn(`foreign-harness: cannot resume ${engine} session, starting fresh: ${String(error)}`);
+    handle = await createHarnessSession(base);
+    agent.foreignEngineSession = { engine, handle, fresh: true };
+    return agent.foreignEngineSession;
+  }
   // 没有 resumeFrom 就是接不回原会话（哪怕有同引擎的元数据记录，例如记录写失败只剩 sessionId）。
   agent.foreignEngineSession = { engine, handle, fresh: state?.resumeFrom === undefined };
   return agent.foreignEngineSession;
@@ -143,15 +153,17 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   for (const message of decision.messages) session.append("user/message", message, { surfaceOp: "append" });
 
   const route = await engineRoute(ctx, agent, engine, settings);
-  const engineSession = await engineSessionOf(agent, engine, settings, route.authEnv, route.model);
+  let engineSession = await engineSessionOf(agent, engine, settings, route.authEnv, route.model);
   const prompt = promptOf(decision.messages);
-  // 引擎会话全新（接不回原对话）才摊历史兜底，且只摊一次（回合成功才消费，失败重试还要重喂）。
-  let context = "";
-  if (engineSession.fresh) {
-    context = historyTextOf(session, new Set(decision.messages.map((message) => message.id)));
-  }
-  const input = context === "" ? prompt : `${context}\n\n（以上是此前的对话记录。下面是用户的新消息。）\n\n${prompt}`;
-  if (input === "") throw new Error(`${engine}: nothing to run — this turn has no user content`);
+  const priorIds = new Set(decision.messages.map((message) => message.id));
+  // 引擎会话全新（接不回原对话）才摊历史兜底；fallback 换会话后要重算，所以做成闭包。
+  const inputOf = () => {
+    const context = engineSession.fresh ? historyTextOf(session, priorIds) : "";
+    const input = context === "" ? prompt : `${context}\n\n（以上是此前的对话记录。下面是用户的新消息。）\n\n${prompt}`;
+    if (input === "") throw new Error(`${engine}: nothing to run — this turn has no user content`);
+    return input;
+  };
+  let input = inputOf();
 
   const selection = agent.model.current();
   const source = { provider: engine, model: selection?.model ?? "default" };
@@ -347,9 +359,29 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     }
   };
 
+  const runTurn = async () => {
+    try {
+      await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
+      engineSession.fresh = false;
+    } catch (error) {
+      // 零产出 + 非中断 = 疑似引擎会话级失效（stale resume）：换 fresh 会话重喂一次。已有段/工具就不重试，避免重复副作用。
+      if (engineSession.fresh || attempt !== null || callSeqs.size > 0 || signal.aborted) throw error;
+      console.warn(`foreign-harness: ${engine} turn failed before any output, retrying fresh: ${String(error)}`);
+      const sessionId = engineSession.handle.sessionId;
+      await engineSession.handle.destroy().catch(() => {});
+      agent.foreignEngineSession = undefined;
+      cliIdHint = undefined;
+      finishReason = { kind: "stop" };
+      finishUsage = undefined;
+      engineSession = await engineSessionOf(agent, engine, settings, route.authEnv, route.model, { ignoreState: true, sessionId });
+      input = inputOf();
+      await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
+      engineSession.fresh = false;
+    }
+  };
+
   try {
-    await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
-    engineSession.fresh = false;
+    await runTurn();
   } catch (error) {
     // 中断/失败也把可见产出落盘（stock 同款 interrupted），否则界面上这轮凭空消失。
     const aborted = signal.aborted;
