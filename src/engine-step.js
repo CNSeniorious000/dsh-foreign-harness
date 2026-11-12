@@ -355,7 +355,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       finishReason = finishKindOf(part.finishReason);
       if (part.usage !== undefined) finishUsage = normalizeUsage(part.usage);
       // 引擎侧会话 id 官方就挂在 finish 部件的 providerMetadata（harness 透传 harnessMetadata）上。
-      cliIdHint ??= part.providerMetadata?.["claude-code"]?.sessionId ?? part.providerMetadata?.codex?.threadId ?? part.providerMetadata?.["codex"]?.threadId;
+      cliIdHint ??= part.providerMetadata?.["claude-code"]?.sessionId ?? part.providerMetadata?.codex?.threadId;
     }
   };
 

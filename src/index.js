@@ -43,12 +43,8 @@ function patchAgent(serviceCtx, ownerCtx, handle, settingsOf) {
     const engine = engineOfSession(this.session);
     if (engine === undefined) return stockStep(decision);
     const signal = this.phase.abort.signal;
-    try {
-      // 设置项是 volatile 活配置：每 step 现读，别在创建时冻进闭包。
-      return await runEngineStep(this, decision, { turn: this.phase.turn, signal, engine, settings: settingsOf(), ctx: serviceCtx, claimStep: () => this.phase.step++ });
-    } finally {
-      await decision.toolSet?.dispose?.();
-    }
+    // 设置项是 volatile 活配置：每 step 现读，别在创建时冻进闭包。toolSet 由 stock turn() 的 finally dispose。
+    return await runEngineStep(this, decision, { turn: this.phase.turn, signal, engine, settings: settingsOf(), ctx: serviceCtx, claimStep: () => this.phase.step++ });
   };
   const dispose = async () => {
     await disposeEngineSession(agent).catch(() => {});
