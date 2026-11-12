@@ -126,6 +126,23 @@ const finishKindOf = (reason) => {
   return { kind: "stop" };
 };
 
+// MCP 工具的美化：`mcp__<server>__<tool>` 显示成 `<tool>`；args 的语义 key 排到首位——
+// dsh 的 generic 工具卡摘要取 args 的第一个字符串值，不排的话摘要是一串 session_id。
+const SUMMARY_KEYS = ["title", "description", "objective", "task", "task_name", "name", "question", "prompt", "message", "command", "cmd", "query", "pattern", "code", "url", "uri", "file_path", "path", "target", "action", "status"];
+function prettyToolCall(name, args) {
+  const parts = String(name).split("__");
+  const short = parts.length >= 3 && parts[0] === "mcp" ? parts.slice(2).join("__") : name;
+  try {
+    const parsed = JSON.parse(args);
+    const reordered = {};
+    for (const key of SUMMARY_KEYS) if (key in parsed) reordered[key] = parsed[key];
+    for (const [key, value] of Object.entries(parsed)) if (!(key in reordered)) reordered[key] = value;
+    return { name: short, args: JSON.stringify(reordered) };
+  } catch {
+    return { name: short, args };
+  }
+}
+
 // Codex 的 command_execution 自带 `/bin/zsh -lc '…'` 壳（cli 用 login shell 跑命令）——剥掉壳，
 // 卡片和 input 面板显示真实命令。两种引号形态都要认；单引号壳里 shell 用 '"'"' 转义单引号。
 function stripShellWrapper(args) {
@@ -337,8 +354,9 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     if (part.type === "tool-call" || part.type === "tool-input-available") {
       const toolCallId = part.toolCallId ?? part.id;
       // Claude 的 Task 工具在 wire 上叫 Agent；dsh 的界面只把 `subagent*` 认成子代理委托。
-      const name = part.toolName === "Agent" ? "subagent" : part.toolName;
-      const args = stripShellWrapper(open.get(toolCallId)?.args || JSON.stringify(part.input ?? {}));
+      const pretty = prettyToolCall(part.toolName === "Agent" ? "subagent" : part.toolName, stripShellWrapper(open.get(toolCallId)?.args || JSON.stringify(part.input ?? {})));
+      const name = pretty.name;
+      const args = pretty.args;
       const entry = open.get(toolCallId);
       if (entry === undefined) {
         const created = openBlock(toolCallId, "tool", { toolCallId, name });

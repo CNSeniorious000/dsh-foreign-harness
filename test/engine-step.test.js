@@ -292,3 +292,16 @@ test("codex shell wrappers are stripped from tool call commands", async () => {
   const commands = events.filter((e) => e.type === "tool/call").map((e) => JSON.parse(e.data.arguments).command);
   expect(commands).toEqual(["echo it", "git status && echo 'q'"]);
 });
+
+test("mcp tool names are shortened and semantic args lead the summary", async () => {
+  const { events } = await run([
+    { type: "tool-call", toolCallId: "c1", toolName: "mcp__py__ipython_execute_code", input: { session_id: "d9ac5ed8-uuid", code: "print(1)" } },
+    { type: "tool-result", toolCallId: "c1", providerExecuted: true, output: "ok" },
+    { type: "finish-step", finishReason: "stop" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  const call = events.find((e) => e.type === "tool/call");
+  expect(call.data.name).toBe("ipython_execute_code");
+  // deriveSummary 对 generic 取 args 首值——code 要排在 session_id 前，摘要才不是 uuid。
+  expect(JSON.parse(call.data.arguments)).toEqual({ code: "print(1)", session_id: "d9ac5ed8-uuid" });
+});
