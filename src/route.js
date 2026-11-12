@@ -41,6 +41,10 @@ export async function engineRoute(ctx, agent, engine, settings) {
   const env = {};
   for (const [key, value] of Object.entries(process.env)) if (key.startsWith("ANTHROPIC_") && value) env[key] = value;
   if (engine === "claude-code") {
+    // CLI 只会说 Anthropic Messages 协议：provider 若声明了别的 wire（openai-responses 等），
+    // 打出去只会 404/400 伪装成网络问题——协议不匹配就地拒绝。
+    const api = readField(profile?.api);
+    if (api !== undefined && !String(api).includes("anthropic")) throw new Error(`provider "${selection.provider}" speaks "${api}", but the claude-code engine talks the anthropic-messages protocol — pick an anthropic-protocol provider or front it with a converting gateway`);
     // 空字符串视同未配置（credentials seam 同一口径），继续落回下一级。
     const apiKey = settings.anthropicApiKey || storedKey || undefined;
     Object.assign(env, defined({
