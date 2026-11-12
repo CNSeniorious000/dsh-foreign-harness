@@ -51,6 +51,11 @@ export async function engineRoute(ctx, agent, engine, settings) {
       ANTHROPIC_BASE_URL: settings.anthropicBaseUrl ?? profile?.baseURL,
       ANTHROPIC_MODEL: model,
       ANTHROPIC_AUTH_TOKEN: apiKey,
+      // CLI 内部（子代理、后台小任务）会用别名模型名；钉到选的模型，免得把 claude-haiku-* 打到第三方端点上。
+      ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
+      CLAUDE_CODE_SUBAGENT_MODEL: model,
     }));
     // 认证头用 Bearer（AUTH_TOKEN）：CLI 的优先级里 OAuth 文件压过 ANTHROPIC_API_KEY，只有 AUTH_TOKEN 能赢；
     // 网关侧 Bearer 与 x-api-key 都认。有解析出的 key 就别留宿主的 API_KEY 抢头。
