@@ -62,7 +62,14 @@ export class EngineStreamAttempt {
    * @param {() => number} append 提交 durable 事件，返回 seq
    */
   settle(eventType, append) {
-    const seq = append();
+    let seq;
+    try {
+      seq = append();
+    } catch (error) {
+      // durable append 失败时没有可提交的 settlement，和 stock 一样先 abandon（关掉 live 流）再把原错误抛回去。
+      this.abandon();
+      throw error;
+    }
     this.#emit({ type: "end", attemptId: this.attemptId, revision: this.#nextRevision(), index: this.#index++, outcome: { kind: "committed", eventType, seq } });
     this.#ended = true;
   }
