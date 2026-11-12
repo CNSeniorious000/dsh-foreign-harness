@@ -126,6 +126,22 @@ const finishKindOf = (reason) => {
   return { kind: "stop" };
 };
 
+// Codex 的 command_execution 自带 `/bin/zsh -lc '…'` 壳（cli 用 login shell 跑命令）——剥掉壳，
+// 卡片和 input 面板显示真实命令。两种引号形态都要认；单引号壳里 shell 用 '"'"' 转义单引号。
+function stripShellWrapper(args) {
+  try {
+    const parsed = JSON.parse(args);
+    const raw = parsed?.command;
+    if (typeof raw !== "string") return args;
+    const match = raw.match(/^(?:\/bin\/)?(?:zsh|bash|sh) -l?c (["'])([\s\S]*)\1$/);
+    if (match === null) return args;
+    parsed.command = match[1] === "'" ? match[2].replaceAll("'\"'\"'", "'") : match[2].replaceAll('\\"', '"');
+    return JSON.stringify(parsed);
+  } catch {
+    return args;
+  }
+}
+
 // usage 两代形状都要认：平铺（inputTokens: number + inputTokenDetails）与嵌套
 // （inputTokens: {total, cacheRead, cacheWrite}）——codex adapter 发的是后者，不摊平会把
 // 整个对象当 token 数存进 durable message（UI 读数直接坏）。
@@ -322,7 +338,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       const toolCallId = part.toolCallId ?? part.id;
       // Claude 的 Task 工具在 wire 上叫 Agent；dsh 的界面只把 `subagent*` 认成子代理委托。
       const name = part.toolName === "Agent" ? "subagent" : part.toolName;
-      const args = open.get(toolCallId)?.args || JSON.stringify(part.input ?? {});
+      const args = stripShellWrapper(open.get(toolCallId)?.args || JSON.stringify(part.input ?? {}));
       const entry = open.get(toolCallId);
       if (entry === undefined) {
         const created = openBlock(toolCallId, "tool", { toolCallId, name });

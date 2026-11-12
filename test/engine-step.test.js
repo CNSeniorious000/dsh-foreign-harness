@@ -279,3 +279,16 @@ test("engine step shells are dropped; marked segment boundaries pass", () => {
   stock.session.append("step/start", { turn: 1, step: 1 });
   expect(appended.map((event) => event.type)).toEqual(["step/start", "step/start"]);
 });
+
+test("codex shell wrappers are stripped from tool call commands", async () => {
+  const { events } = await run([
+    { type: "tool-call", toolCallId: "c1", toolName: "shell", input: { command: "/bin/zsh -lc 'echo it'" } },
+    { type: "tool-result", toolCallId: "c1", providerExecuted: true, output: "it" },
+    { type: "tool-call", toolCallId: "c2", toolName: "shell", input: { command: "/bin/zsh -lc \"git status && echo 'q'\"" } },
+    { type: "tool-result", toolCallId: "c2", providerExecuted: true, output: "ok" },
+    { type: "finish-step", finishReason: "stop" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  const commands = events.filter((e) => e.type === "tool/call").map((e) => JSON.parse(e.data.arguments).command);
+  expect(commands).toEqual(["echo it", "git status && echo 'q'"]);
+});
