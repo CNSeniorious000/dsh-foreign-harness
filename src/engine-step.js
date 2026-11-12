@@ -144,8 +144,25 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
 
   const selection = agent.model.current();
   const source = { provider: engine, model: selection?.model ?? "default" };
-  /** @type {{ callId: string, text: string, isError: boolean }[]} */
-  const results = [];
+  /** @type {Map<string, number>} callId → tool/call 事件 seq（tool/result 回指用） */
+  const callSeqs = new Map();
+  const reported = new Set();
+  // tool/call 在调用落定的瞬间就发（stock 的 dispatch 语义）：卡片从 preparing 转正才能展开，
+  // result 也才有配对锚点——攒到回合结束才发的话，整个回合的卡片都是不可展开的空壳草稿。
+  const dbg = (obj) => { if (process.env.DSH_FH_DEBUG) appendFileSync(process.env.DSH_FH_DEBUG, JSON.stringify(obj) + "\n"); };
+  const dispatchToolCall = (callId, name, args) => {
+    if (callSeqs.has(callId)) return;
+    const seq = session.append("tool/call", { turn, step, callId, name, arguments: args }).seq;
+    callSeqs.set(callId, seq);
+    dbg({ event: "tool/call", seq, turn, step, name });
+  };
+  const commitToolResult = (callId, text, isError) => {
+    const callSeq = callSeqs.get(callId);
+    if (callSeq === undefined) return;
+    reported.add(callId);
+    const seq = session.append("tool/result", { turn, step, message: createToolResultMessage({ callId, content: [{ type: "text", text }], isError }) }, { surfaceOp: "append", sourceEventSeqs: [callSeq] }).seq;
+    dbg({ event: "tool/result", seq, turn, step });
+  };
   // 流翻译的块索引账本：harness 的部件 id → dsh 的块序号与缓冲。
   let index = 0;
   const open = new Map();
@@ -236,15 +253,16 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
         }
         closeBlock(toolCallId, { type: "tool-call", id: toolCallId, name, arguments: entry.args });
       }
+      dispatchToolCall(toolCallId, name, args);
     }
-    // 工具结果（引擎内部执行，providerExecuted 才是真结果）。
+    // 工具结果（引擎内部执行，providerExecuted 才是真结果）——到一个落一个，卡片即时收口。
     if ((part.type === "tool-result" || part.type === "tool-output-available") && part.providerExecuted) {
       const output = typeof part.output === "string" ? part.output : JSON.stringify(part.output) ?? "";
-      results.push({ callId: part.toolCallId, text: output.slice(0, 8000), isError: false });
+      commitToolResult(part.toolCallId, output.slice(0, 8000), false);
     }
     if ((part.type === "tool-error" || part.type === "tool-output-error") && part.providerExecuted) {
       const error = part.error ?? part.errorText;
-      results.push({ callId: part.toolCallId, text: String(error?.message ?? error).slice(0, 8000), isError: true });
+      commitToolResult(part.toolCallId, String(error?.message ?? error).slice(0, 8000), true);
     }
     if (part.type === "finish-step" && part.usage !== undefined) takeUsage(part.usage);
     if (part.type === "finish") {
@@ -269,6 +287,8 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
     } else if (!attempt.ended) {
       attempt.settle("assistant/attempt", () => session.append("assistant/attempt", { turn, step, stream: attempt.stream }).seq);
     }
+    // 中断时未回报的调用同样补终止结果，卡片不能永远「运行中」。
+    for (const callId of callSeqs.keys()) if (!reported.has(callId)) commitToolResult(callId, "(no result)", true);
     throw error;
   } finally {
     await rememberEngineState(ctx, agent, engine, engineSession, route.llm, cliIdHint);
@@ -277,34 +297,14 @@ export async function runEngineStep(agent, decision, { turn, step, signal, engin
   if (usage !== undefined) attempt.push({ type: "usage", usage });
   attempt.push({ type: "finish", reason: finishReason });
   const content = attempt.blocks();
-  attempt.settle("assistant/message", () =>
-    session.append("assistant/message", { turn, step, message: createAssistantMessage({ content, source }), stream: attempt.stream, ...(usage === undefined ? {} : { usage }) }, { surfaceOp: "append" }).seq,
-  );
+  attempt.settle("assistant/message", () => {
+    const seq = session.append("assistant/message", { turn, step, message: createAssistantMessage({ content, source }), stream: attempt.stream, ...(usage === undefined ? {} : { usage }) }, { surfaceOp: "append" }).seq;
+    dbg({ event: "assistant/message", seq, turn, step });
+    return seq;
+  });
 
-  // tool/call 才是客户端画出带名字和参数的调用卡的来源；tool/result 再用 sourceEventSeqs 指回它。
-  const callSeqs = new Map();
-  for (const block of content) if (block.type === "tool-call") {
-    callSeqs.set(block.id, session.append("tool/call", { turn, step, callId: block.id, name: block.name, arguments: block.arguments }).seq);
-  }
-  const reported = new Set();
-  for (const result of results) {
-    const callSeq = callSeqs.get(result.callId);
-    if (callSeq === undefined) continue;
-    reported.add(result.callId);
-    session.append(
-      "tool/result",
-      { turn, step, message: createToolResultMessage({ callId: result.callId, content: [{ type: "text", text: result.text }], isError: result.isError }) },
-      { surfaceOp: "append", sourceEventSeqs: [callSeq] },
-    );
-  }
-  // 已记录但没回报的调用补一个终止结果，否则卡片永远停在「执行中」。
-  for (const block of content) if (block.type === "tool-call" && !reported.has(block.id)) {
-    session.append(
-      "tool/result",
-      { turn, step, message: createToolResultMessage({ callId: block.id, content: [{ type: "text", text: "(no result)" }], isError: true }) },
-      { surfaceOp: "append", sourceEventSeqs: [callSeqs.get(block.id)] },
-    );
-  }
+  // 已调用但没回报的补一个终止结果，否则卡片永远停在「运行中」。
+  for (const callId of callSeqs.keys()) if (!reported.has(callId)) commitToolResult(callId, "(no result)", true);
 
   return finishReason.kind === "max-tokens" ? { kind: "max-tokens" } : { kind: "completed" };
 }

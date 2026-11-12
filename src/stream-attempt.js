@@ -2,6 +2,7 @@
 // 客户端按 revision 连续性校验（断号直接废掉流），end 帧的 outcome 必须和 durable append 对齐。
 // stock 的 AssistantStreamAttempt 没有导出，这里用 dsh-llm 的公开原语自己实现。
 import { AssistantStreamAccumulator, BlockAssembler, LlmAttemptId } from "@deepseek-ai/dsh-llm";
+import { appendFileSync } from "node:fs";
 
 export class EngineStreamAttempt {
   #emit;
@@ -19,7 +20,13 @@ export class EngineStreamAttempt {
     this.turn = turn;
     this.step = step;
     this.#nextRevision = nextRevision;
-    this.#emit = emit;
+    // 诊断通道：DSH_FH_DEBUG 时把发出的帧（rev/index/turn/step）按序落盘。
+    this.#emit = process.env.DSH_FH_DEBUG
+      ? (frame) => {
+          try { appendFileSync(process.env.DSH_FH_DEBUG, JSON.stringify({ frame: frame.type, rev: frame.revision, idx: frame.index, turn: frame.turn, step: frame.step, chunkType: frame.chunk?.type }) + "\n"); } catch {}
+          emit(frame);
+        }
+      : emit;
   }
 
   get ended() { return this.#ended; }
