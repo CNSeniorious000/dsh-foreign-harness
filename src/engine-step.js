@@ -56,11 +56,13 @@ function lastStateOf(session, engine) {
   return undefined;
 }
 
-/** 每个 dsh 会话一个引擎会话；引擎切换走新 sessionId，互不干扰。 */
+/** 每个 dsh 会话一个引擎会话；引擎切换走新 sessionId，互不干扰。认证/模型是 volatile 活配置——
+ * CLI 进程的 env 在 spawn 时冻结，配置变了必须换会话（走 resumeFrom 续聊），否则改 key/gateway 静默不生效。 */
 async function engineSessionOf(agent, engine, settings, authEnv, model, { ignoreState = false, sessionId } = {}) {
   const cached = agent.foreignEngineSession;
-  if (cached?.engine === engine) return cached;
-  if (cached !== undefined) { await cached.handle.destroy(); agent.foreignEngineSession = undefined; }
+  const fingerprint = JSON.stringify(defined({ authEnv, model }));
+  if (cached?.engine === engine && cached.fingerprint === fingerprint) return cached;
+  if (cached !== undefined) { await cached.handle.destroy().catch(() => {}); agent.foreignEngineSession = undefined; }
   const state = ignoreState ? undefined : lastStateOf(agent.session, engine);
   const base = {
     engine,
@@ -78,11 +80,11 @@ async function engineSessionOf(agent, engine, settings, authEnv, model, { ignore
     // createSession 层的续接失败（lifecycle 校验/schema）降级为新会话；stale 引擎会话的真实失败在 turn 层重试。
     console.warn(`foreign-harness: cannot resume ${engine} session, starting fresh: ${String(error)}`);
     handle = await createHarnessSession(base);
-    agent.foreignEngineSession = { engine, handle, fresh: true };
+    agent.foreignEngineSession = { engine, handle, fresh: true, fingerprint };
     return agent.foreignEngineSession;
   }
   // 没有 resumeFrom 就是接不回原会话（哪怕有同引擎的元数据记录，例如记录写失败只剩 sessionId）。
-  agent.foreignEngineSession = { engine, handle, fresh: state?.resumeFrom === undefined };
+  agent.foreignEngineSession = { engine, handle, fresh: state?.resumeFrom === undefined, fingerprint };
   return agent.foreignEngineSession;
 }
 

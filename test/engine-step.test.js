@@ -130,6 +130,24 @@ test("a failed createSession resume retries once without resumeFrom", async () =
   expect(attempted.call.input).toContain("previous");
 });
 
+test("a route change rebuilds the engine session; unchanged route reuses it", async () => {
+  // CLI 进程 env 在 spawn 时冻结：改 key/gateway 不换会话就静默不生效。
+  calls.length = 0;
+  creates.length = 0;
+  const events = [];
+  const agent = makeAgent(events);
+  agent.session.seq = 1;
+  agent.session.eventAt = () => state("claude-code", resumeFrom);
+  const decision = { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }] };
+  const step = (settings) => runEngineStep(agent, decision, { turn: 1, signal: new AbortController().signal, engine: "claude-code", settings, ctx: { get: () => undefined }, claimStep: () => 1 });
+  parts.splice(0, parts.length, { type: "finish", finishReason: "stop" });
+  await step({ anthropicBaseUrl: "https://a" });
+  await step({ anthropicBaseUrl: "https://b" });
+  expect(creates).toHaveLength(2);
+  await step({ anthropicBaseUrl: "https://b" });
+  expect(creates).toHaveLength(2);
+});
+
 test("a zero-output turn failure retries fresh once and re-feeds history", async () => {
   failTurns = 1;
   const attempted = await runAs("claude-code", [state("claude-code", resumeFrom)]);
