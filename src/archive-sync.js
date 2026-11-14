@@ -41,10 +41,17 @@ async function cliIdsOf(name, cache) {
   if (cached?.size === info.size) return cached.ids;
   const text = await readFile(path, "utf8").catch(() => undefined);
   if (text === undefined) return {};
+  // 逐行 JSON 解析而不是匹配序列化形态：键序/字段增减会静默弄丢 id（resume 从此永久断掉还不报错）。
   let threadId;
-  for (const match of text.matchAll(/"type":"bridge-thread","threadId":"([^"]+)"/g)) threadId = match[1];
   let claudeSessionId;
-  for (const match of text.matchAll(/"harnessMetadata":\{"claude-code":\{[^{}]*"sessionId":"([^"]+)"/g)) claudeSessionId = match[1];
+  for (const line of text.split("\n")) {
+    try {
+      const event = JSON.parse(line);
+      if (event.type === "bridge-thread") threadId = event.threadId;
+      const claude = event.harnessMetadata?.["claude-code"];
+      if (claude?.sessionId !== undefined) claudeSessionId = claude.sessionId;
+    } catch {}
+  }
   const ids = { threadId, claudeSessionId };
   cache.set(name, { size: info.size, ids });
   return ids;
