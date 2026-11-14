@@ -48,7 +48,7 @@ const makeAgent = (events) => ({
   dispatch: { emit: () => {} },
 });
 
-const run = async (streamParts) => {
+const run = async (streamParts, engine = "claude-code") => {
   parts.splice(0, parts.length, ...streamParts);
   const events = [];
   let step = 1;
@@ -56,7 +56,7 @@ const run = async (streamParts) => {
   const result = await runEngineStep(agent, { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }] }, {
     turn: 1,
     signal: new AbortController().signal,
-    engine: "claude-code",
+    engine,
     settings: {},
     ctx: { get: () => undefined },
     claimStep: () => step++,
@@ -311,9 +311,21 @@ test("codex shell wrappers are stripped from tool call commands", async () => {
     { type: "tool-result", toolCallId: "c2", providerExecuted: true, output: "ok" },
     { type: "finish-step", finishReason: "stop" },
     { type: "finish", finishReason: "stop" },
-  ]);
+  ], "codex");
   const commands = events.filter((e) => e.type === "tool/call").map((e) => JSON.parse(e.data.arguments).command);
   expect(commands).toEqual(["echo it", "git status && echo 'q'"]);
+});
+
+test("other engines' commands are recorded verbatim", async () => {
+  // 剥壳是 codex wire（argv join 回来的壳）的还原；claude-code 的命令是模型原文，不能改写。
+  const { events } = await run([
+    { type: "tool-call", toolCallId: "c1", toolName: "Bash", input: { command: "bash -lc 'npm test'" } },
+    { type: "tool-result", toolCallId: "c1", providerExecuted: true, output: "ok" },
+    { type: "finish-step", finishReason: "stop" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  const call = events.find((e) => e.type === "tool/call");
+  expect(JSON.parse(call.data.arguments).command).toBe("bash -lc 'npm test'");
 });
 
 test("mcp tool names are shortened and semantic args lead the summary", async () => {
@@ -329,6 +341,23 @@ test("mcp tool names are shortened and semantic args lead the summary", async ()
   expect(JSON.parse(call.data.arguments)).toEqual({ code: "print(1)", session_id: "d9ac5ed8-uuid" });
 });
 
+test("streamed tool inputs settle the same name and args as the tool call event", async () => {
+  // 流式路径（tool-input-start/delta）的终态块要与 tool/call 事件一致，否则直播与回放两套显示。
+  const { events } = await run([
+    { type: "tool-input-start", id: "c1", toolName: "mcp__py__ipython_execute_code" },
+    { type: "tool-input-delta", id: "c1", delta: "{\"session_id\": \"d9ac5ed8-uuid\", \"code\": \"print(1)\"}" },
+    { type: "tool-call", toolCallId: "c1", toolName: "mcp__py__ipython_execute_code", input: { session_id: "d9ac5ed8-uuid", code: "print(1)" } },
+    { type: "tool-result", toolCallId: "c1", providerExecuted: true, output: "ok" },
+    { type: "finish-step", finishReason: "stop" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  const call = events.find((e) => e.type === "tool/call");
+  const message = events.find((e) => e.type === "assistant/message");
+  const block = message.data.message.content.find((b) => b.type === "tool-call");
+  expect(block.name).toBe(call.data.name);
+  expect(JSON.parse(block.arguments)).toEqual(JSON.parse(call.data.arguments));
+});
+
 test("shell stripping is shape-based, not a shell whitelist", async () => {
   const { events } = await run([
     // 任意 shell 路径 + -c/-lc 都剥；python -c 这类不是 shell 壳，不碰。
@@ -338,7 +367,7 @@ test("shell stripping is shape-based, not a shell whitelist", async () => {
     { type: "tool-result", toolCallId: "c2", providerExecuted: true, output: "1" },
     { type: "finish-step", finishReason: "stop" },
     { type: "finish", finishReason: "stop" },
-  ]);
+  ], "codex");
   const commands = events.filter((e) => e.type === "tool/call").map((e) => JSON.parse(e.data.arguments).command);
   expect(commands).toEqual(["echo a", "python3 -c 'print(1)'"]);
 });

@@ -130,17 +130,21 @@ const finishKindOf = (reason) => {
 // MCP 工具的美化：`mcp__<server>__<tool>` 显示成 `<tool>`；args 的语义 key 排到首位——
 // dsh 的 generic 工具卡摘要取 args 的第一个字符串值，不排的话摘要是一串 session_id。
 const SUMMARY_KEYS = ["title", "description", "objective", "task", "task_name", "name", "question", "prompt", "message", "command", "cmd", "query", "pattern", "code", "url", "uri", "file_path", "path", "target", "action", "status"];
-function prettyToolCall(name, args) {
+/** 显示名：Claude 的 Task 工具在 wire 上叫 Agent，dsh 的界面只把 `subagent*` 认成子代理委托。 */
+function displayNameOf(toolName) {
+  const name = toolName === "Agent" ? "subagent" : toolName;
   const parts = String(name).split("__");
-  const short = parts.length >= 3 && parts[0] === "mcp" ? parts.slice(2).join("__") : name;
+  return parts.length >= 3 && parts[0] === "mcp" ? parts.slice(2).join("__") : name;
+}
+function prettyToolCall(name, args) {
   try {
     const parsed = JSON.parse(args);
     const reordered = {};
     for (const key of SUMMARY_KEYS) if (key in parsed) reordered[key] = parsed[key];
     for (const [key, value] of Object.entries(parsed)) if (!(key in reordered)) reordered[key] = value;
-    return { name: short, args: JSON.stringify(reordered) };
+    return { name: displayNameOf(name), args: JSON.stringify(reordered) };
   } catch {
-    return { name: short, args };
+    return { name: displayNameOf(name), args };
   }
 }
 
@@ -350,7 +354,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       closeBlock(part.id, { type: "reasoning", text: entry?.buffer ?? "" });
     }
     // 工具参数流式：bridge 的 tool-input-* 部件用 id/delta，完成部件（tool-call）才叫 toolCallId。
-    if (part.type === "tool-input-start") openBlock(part.id, "tool", { toolCallId: part.id, name: part.toolName });
+    if (part.type === "tool-input-start") openBlock(part.id, "tool", { toolCallId: part.id, name: displayNameOf(part.toolName) });
     if (part.type === "tool-input-delta") {
       const entry = open.get(part.id);
       if (entry !== undefined) {
@@ -362,8 +366,10 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     // 工具调用完成：新旧两代部件名都要认（harness 两代都发）。
     if (part.type === "tool-call" || part.type === "tool-input-available") {
       const toolCallId = part.toolCallId ?? part.id;
-      // Claude 的 Task 工具在 wire 上叫 Agent；dsh 的界面只把 `subagent*` 认成子代理委托。
-      const pretty = prettyToolCall(part.toolName === "Agent" ? "subagent" : part.toolName, stripShellWrapper(open.get(toolCallId)?.args || JSON.stringify(part.input ?? {})));
+      // 剥壳只对 codex：它的 command 是 argv join 回来的 `zsh -lc '...'` 包装，剥掉是还原；
+      // 别的引擎的 command 是原文，剥壳就是篡改记录。
+      const rawArgs = open.get(toolCallId)?.args || JSON.stringify(part.input ?? {});
+      const pretty = prettyToolCall(part.toolName, engine === "codex" ? stripShellWrapper(rawArgs) : rawArgs);
       const name = pretty.name;
       const args = pretty.args;
       const entry = open.get(toolCallId);
@@ -378,7 +384,9 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
           entry.args = JSON.stringify(part.input);
           attempt.push({ type: "tool-call-delta", index: entry.index, id: toolCallId, name, argumentsDelta: entry.args });
         }
-        closeBlock(toolCallId, { type: "tool-call", id: toolCallId, name, arguments: entry.args });
+        // 终态以 pretty 为准：assistant/message 的块与 tool/call 事件三处一致（流式 delta 是到达序原文，不重排）。
+        entry.args = args;
+        closeBlock(toolCallId, { type: "tool-call", id: toolCallId, name, arguments: args });
       }
       bufferSegEvent({ kind: "call", callId: toolCallId, name, args });
     }
