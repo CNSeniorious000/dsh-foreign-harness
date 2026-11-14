@@ -389,7 +389,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     }
     if ((part.type === "tool-error" || part.type === "tool-output-error") && part.providerExecuted) {
       const error = part.error ?? part.errorText;
-      bufferSegEvent({ kind: "result", callId: part.toolCallId, text: String(error?.message ?? error).slice(0, 8000), isError: true });
+      bufferSegEvent({ kind: "result", callId: part.toolCallId, text: String(error?.message ?? error ?? "engine reported a tool error without details").slice(0, 8000), isError: true });
     }
     if (part.type === "finish-step" && attempt !== null) {
       finishSegment({ reason: finishKindOf(part.finishReason), usage: part.usage === undefined ? undefined : normalizeUsage(part.usage) });
