@@ -19,6 +19,15 @@ test("run captures stdout and exit code", async () => {
   await sandbox.destroy();
 });
 
+test("an aborted run reports a signal exit code, not success", async () => {
+  const sandbox = await makeSandbox();
+  const controller = new AbortController();
+  const running = sandbox.run({ command: "sleep 5", abortSignal: controller.signal });
+  controller.abort();
+  expect((await running).exitCode).toBe(137); // 128 + SIGKILL
+  await sandbox.destroy();
+});
+
 test("file round-trip: write, read, stat, list, delete", async () => {
   const sandbox = await makeSandbox();
   await sandbox.writeFile({ path: "sub/note.txt", content: "第一行\n第二行\n第三行" });

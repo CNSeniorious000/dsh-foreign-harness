@@ -5,9 +5,13 @@ import { mkdir, readFile, writeFile as writeFileToDisk, stat as statPath, readdi
 import { Readable, Writable } from "node:stream";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { constants } from "node:os";
 
 /** @param {string | Uint8Array | Blob} content @returns {Promise<Buffer>} */
 const bytesOf = async (content) => (typeof content === "string" ? Buffer.from(content) : content instanceof Uint8Array ? Buffer.from(content) : Buffer.from(await new Response(content).arrayBuffer()));
+
+// 被信号杀死的进程没有退出码：按 POSIX 惯例报 128+signum，否则 abort/OOM 杀掉的子进程伪装成成功退出。
+const exitCodeOf = (code, signal) => code ?? (signal == null ? 0 : 128 + (constants.signals[signal] ?? 0));
 
 // 全局表只服务进程退出钩子：dsh 直接退出时 effect 清理不跑，bridge 会活下来占端口。dsh 宿主接了 SIGTERM/SIGINT 并走
 // 优雅退出（exit 钩子会跑），所以这里不用再抢信号。destroy() 只杀自己会话的子进程——并发会话各有 bridge，全局收割会误杀别人的回合。
@@ -51,8 +55,8 @@ export function createLocalSandbox({ root, port, stripAnthropic = process.env.DS
       stderr: Readable.toWeb(child.stderr),
       wait: () => new Promise((ok, fail) => {
         // exit 事件而非 close：unref 过的 stdio 永远不 EOF。已退出要立即返回，晚注册的监听者收不到历史事件。
-        if (child.exitCode !== null || child.signalCode !== null) return ok({ exitCode: child.exitCode ?? 0 });
-        child.on("exit", (code) => ok({ exitCode: code ?? 0 }));
+        if (child.exitCode !== null || child.signalCode !== null) return ok({ exitCode: exitCodeOf(child.exitCode, child.signalCode) });
+        child.on("exit", (code, signal) => ok({ exitCode: exitCodeOf(code, signal) }));
         child.on("error", fail);
       }),
       kill: async () => { child.kill("SIGKILL"); },
