@@ -9,8 +9,10 @@ import { createCodex } from "@ai-sdk/harness-codex";
 import { createLocalSandbox } from "./sandbox.js";
 
 /** @returns {Promise<number>} */
-const freePort = () => new Promise((ok) => {
+const freePort = () => new Promise((ok, fail) => {
   const server = createServer();
+  // listen 失败（EMFILE 等）走 error 事件：没有监听者就是 uncaughtException，直接崩宿主。
+  server.on("error", fail);
   server.listen(0, "127.0.0.1", () => {
     const port = server.address().port;
     server.close(() => ok(port));
