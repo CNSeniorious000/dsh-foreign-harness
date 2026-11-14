@@ -12,17 +12,23 @@ import { readField } from "./route.js";
 
 const envFlag = (name, fallback) => (process.env[name] !== undefined ? process.env[name] === "1" : fallback ?? false);
 
-/** preset id 就是引擎名；无 preset 记录（headless）才看 DSH_CC_ENGINE。 */
+/** preset id 就是引擎名；无 preset 记录（headless）才看 DSH_CC_ENGINE。
+ * 调用点在 append 热路径（每步的 step/start、step/end 守卫）上；preset 记录在会话开头附近，
+ * 全量回扫是 O(事件数) 每次——只扫上次缓存点之后的新事件。 */
+const engineCache = new WeakMap();
 export function engineOfSession(session) {
-  for (let seq = session.seq - 1; seq >= 0; seq--) {
+  const cached = engineCache.get(session);
+  let found;
+  for (let seq = session.seq - 1; seq >= (cached?.upto ?? 0); seq--) {
     const event = session.eventAt(seq);
-    if (event?.type === "agent-preset/selected") {
-      const preset = event.data.agentPreset;
-      return ENGINES.has(preset) ? preset : undefined;
-    }
+    if (event?.type === "agent-preset/selected") { found = event.data.agentPreset; break; }
   }
-  const env = process.env.DSH_CC_ENGINE;
-  return ENGINES.has(env) ? env : undefined;
+  let engine;
+  if (found !== undefined) engine = ENGINES.has(found) ? found : undefined;
+  else if (cached !== undefined) engine = cached.engine;
+  else { const env = process.env.DSH_CC_ENGINE; engine = ENGINES.has(env) ? env : undefined; }
+  engineCache.set(session, { upto: session.seq, engine });
+  return engine;
 }
 
 /** 引擎回合的段要成为顺序的顶级 step：丢弃 stock turn() 在 step() 前后发的未标记 shell 边界。 */

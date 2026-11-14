@@ -30,7 +30,7 @@ mock.module("../src/harness.js", () => ({
 }));
 // mock.module 要先于被测模块加载（import 声明会提升），故动态 import。
 const { runEngineStep } = await import("../src/engine-step.js");
-const { guardEngineStepBoundaries } = await import("../src/index.js");
+const { guardEngineStepBoundaries, engineOfSession } = await import("../src/index.js");
 
 const makeAgent = (events) => ({
   session: {
@@ -319,6 +319,18 @@ test("engine step shells are dropped; marked segment boundaries pass", () => {
   guardEngineStepBoundaries(stock);
   stock.session.append("step/start", { turn: 1, step: 1 });
   expect(appended.map((event) => event.type)).toEqual(["step/start", "step/start"]);
+});
+
+test("engineOfSession picks up preset switches incrementally", async () => {
+  const events = [{ type: "agent-preset/selected", data: { agentPreset: "codex" } }];
+  const session = { seq: events.length, eventAt: (seq) => events[seq] };
+  expect(engineOfSession(session)).toBe("codex");
+  events.push({ type: "agent-preset/selected", data: { agentPreset: "stock" } });
+  session.seq = events.length;
+  expect(engineOfSession(session)).toBeUndefined();
+  events.push({ type: "agent-preset/selected", data: { agentPreset: "claude-code" } });
+  session.seq = events.length;
+  expect(engineOfSession(session)).toBe("claude-code");
 });
 
 test("codex shell wrappers are stripped from tool call commands", async () => {
