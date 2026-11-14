@@ -163,6 +163,29 @@ test("a turn that produced output is not retried", async () => {
   assertReleasedLog(events);
 });
 
+test("a turn failing after a settled segment is not retried", async () => {
+  // 纯文本段 finish-step 后（attempt 已复位、无工具调用）再挂：整轮重跑会重复回答，
+  // 且 inputOf() 把已 settle 的回答当此前对话喂回去。
+  throwAfterParts = true;
+  calls.length = 0;
+  creates.length = 0;
+  const events = [];
+  const agent = makeAgent(events);
+  agent.session.seq = 1;
+  agent.session.eventAt = () => state("claude-code", resumeFrom);
+  parts.splice(0, parts.length, { type: "text-start", id: "t1" }, { type: "text-delta", id: "t1", text: "answer" }, { type: "text-end", id: "t1" }, { type: "finish-step", finishReason: "stop" });
+  await expect(runEngineStep(agent, { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }] }, {
+    turn: 1,
+    signal: new AbortController().signal,
+    engine: "claude-code",
+    settings: {},
+    ctx: { get: () => undefined },
+    claimStep: () => 1,
+  })).rejects.toThrow("after parts");
+  expect(creates).toHaveLength(1);
+  assertReleasedLog(events);
+});
+
 test("segment settle precedes its tool events; segments pair step/start with step/end", async () => {
   const { events, result } = await run([
     { type: "reasoning-start", id: "r1" },

@@ -243,6 +243,8 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   /** @type {Map<string, {seq: number, step: number}>} callId → tool/call 事件（tool/result 回指与补果用） */
   const callSeqs = new Map();
   const reported = new Set();
+  /** 已有段 settle 过盘（哪怕纯文本段）——整轮重试会产生重复产出并把已 settle 的回答当历史喂回去。 */
+  let produced = false;
 
   const dispatchToolCall = (callId, name, args) => {
     if (callSeqs.has(callId)) return;
@@ -306,6 +308,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     segEvents.length = 0;
     backfillMissingResults();
     appendSegmentBoundary("step/end", attempt.step);
+    produced = true;
     dbg({ event: "segment/end", turn, step: attempt.step });
     open.clear(); // 块台账只活在本段：留着的话，段尾后迟到的 delta/end 会拿陈旧 entry 打到 null attempt
     attempt = null;
@@ -404,8 +407,8 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
       engineSession.fresh = false;
     } catch (error) {
-      // 零产出 + 非中断 = 疑似引擎会话级失效（stale resume）：换 fresh 会话重喂一次。已有段/工具就不重试，避免重复副作用。
-      if (engineSession.fresh || attempt !== null || callSeqs.size > 0 || signal.aborted) throw error;
+      // 零产出 + 非中断 = 疑似引擎会话级失效（stale resume）：换 fresh 会话重喂一次。已有任何落盘产出（含纯文本段）就不重试——重跑会重复回答，且 inputOf() 会把已 settle 的回答当此前对话喂回去。
+      if (engineSession.fresh || produced || attempt !== null || signal.aborted) throw error;
       console.warn(`foreign-harness: ${engine} turn failed before any output, retrying fresh: ${String(error)}`);
       const sessionId = engineSession.handle.sessionId;
       await engineSession.handle.destroy().catch(() => {});
