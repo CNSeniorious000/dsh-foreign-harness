@@ -33,10 +33,10 @@ export async function engineRoute(ctx, agent, engine, settings) {
   const resolved = await Promise.resolve(keyRef === undefined ? undefined : credentials?.resolve?.(keyRef)).catch(() => undefined);
   const storedKey = resolved?.value || (keyRef === undefined ? undefined : launchEnvironmentOf(ctx).get(keyRef)?.value);
 
-  // 模型语义：dsh 里选的那个就是引擎用的那个（设置项是显式覆盖）；codex 沿用自己的模型体系。
+  // 模型语义：dsh 里选的那个就是引擎用的那个（设置项是显式覆盖）；codex 沿用自己的模型体系。空字符串视同未配置（与 apiKey 同口径）。
   const model = engine === "codex"
-    ? settings.codexModel ?? undefined
-    : settings.anthropicModel ?? selection?.model;
+    ? settings.codexModel || undefined
+    : settings.anthropicModel || selection?.model;
 
   const env = {};
   for (const [key, value] of Object.entries(process.env)) if (key.startsWith("ANTHROPIC_") && value) env[key] = value;
@@ -48,7 +48,7 @@ export async function engineRoute(ctx, agent, engine, settings) {
     // 空字符串视同未配置（credentials seam 同一口径），继续落回下一级。
     const apiKey = settings.anthropicApiKey || storedKey || undefined;
     Object.assign(env, defined({
-      ANTHROPIC_BASE_URL: settings.anthropicBaseUrl ?? profile?.baseURL,
+      ANTHROPIC_BASE_URL: settings.anthropicBaseUrl || profile?.baseURL,
       ANTHROPIC_MODEL: model,
       ANTHROPIC_AUTH_TOKEN: apiKey,
       // CLI 内部（子代理、后台小任务）会用别名模型名；钉到选的模型，免得把 claude-haiku-* 打到第三方端点上。

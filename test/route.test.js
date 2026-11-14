@@ -24,3 +24,10 @@ test("provider without an api declaration passes through", async () => {
   const env = await engineRoute(ctxWith({ baseURL: "https://x", apiKeyEnv: "K" }), agent, "claude-code", {});
   expect(env.authEnv.ANTHROPIC_BASE_URL).toBe("https://x");
 });
+
+test("empty settings strings are treated as unconfigured", async () => {
+  // 清空输入框是 "" 不是 undefined——不能穿透成 ANTHROPIC_BASE_URL=""（CLI 会解析出相对地址）。
+  const env = await engineRoute(ctxWith({ baseURL: "https://x", apiKeyEnv: "K" }), agent, "claude-code", { anthropicBaseUrl: "", anthropicModel: "" });
+  expect(env.authEnv.ANTHROPIC_BASE_URL).toBe("https://x");
+  expect(env.authEnv.ANTHROPIC_MODEL).toBe("m");
+});
