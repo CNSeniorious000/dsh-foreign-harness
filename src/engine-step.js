@@ -66,7 +66,8 @@ function lastStateOf(session, engine) {
  * CLI 进程的 env 在 spawn 时冻结，配置变了必须换会话（走 resumeFrom 续聊），否则改 key/gateway 静默不生效。 */
 async function engineSessionOf(agent, engine, settings, authEnv, model, { ignoreState = false, sessionId } = {}) {
   const cached = agent.foreignEngineSession;
-  const fingerprint = JSON.stringify(defined({ authEnv, model }));
+  // 指纹覆盖所有 spawn 时冻结进 sandbox/adapter 的配置：CLI 进程 env、cwd 都不会热更。
+  const fingerprint = JSON.stringify(defined({ authEnv, model, stripAnthropic: settings.stripAnthropicEnv, cwd: agent.session.header?.cwd ?? process.cwd() }));
   if (cached?.engine === engine && cached.fingerprint === fingerprint) return cached;
   if (cached !== undefined) { await cached.handle.destroy().catch(() => {}); agent.foreignEngineSession = undefined; }
   const state = ignoreState ? undefined : lastStateOf(agent.session, engine);
@@ -130,8 +131,9 @@ export async function disposeEngineSession(agent) {
 const finishKindOf = (reason) => {
   if (reason === "tool-calls") return { kind: "tool-calls" };
   if (reason === "length") return { kind: "max-tokens" };
-  if (reason === "error") return { kind: "error", failure: { message: "engine reported an error finish" } };
-  if (reason === "abort") return { kind: "aborted", failure: { message: "engine aborted" } };
+  // wire 词汇是 'interrupted'/'content-filter'（'abort' 只是我们 catch 路径的内部值）；LlmFailure.code 必填。
+  if (reason === "error" || reason === "content-filter") return { kind: "error", failure: { message: `engine reported a ${reason} finish`, code: reason } };
+  if (reason === "abort" || reason === "interrupted") return { kind: "aborted", failure: { message: "engine aborted", code: "aborted" } };
   return { kind: "stop" };
 };
 
@@ -209,11 +211,11 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   const prompt = promptOf(decision.messages);
   const priorIds = new Set(decision.messages.map((message) => message.id));
   // 引擎会话全新（接不回原对话）才摊历史兜底；fallback 换会话后要重算，所以做成闭包。
+  // prompt 是 allowlist（只放真人 user 消息）：全被过滤 = 没有用户输入，对着历史重放只会答非所问——诚实失败。
   const inputOf = () => {
+    if (prompt === "") throw new Error(`${engine}: nothing to run — this turn has no user content`);
     const context = engineSession.fresh ? historyTextOf(session, priorIds) : "";
-    const input = context === "" ? prompt : `${context}\n\n（以上是此前的对话记录。下面是用户的新消息。）\n\n${prompt}`;
-    if (input === "") throw new Error(`${engine}: nothing to run — this turn has no user content`);
-    return input;
+    return context === "" ? prompt : `${context}\n\n（以上是此前的对话记录。下面是用户的新消息。）\n\n${prompt}`;
   };
   let input = inputOf();
 
