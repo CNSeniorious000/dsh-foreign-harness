@@ -313,6 +313,40 @@ test("finish.totalUsage and the turn result seed usage when finish-step carries 
   expect(tail.events.filter((e) => e.type === "assistant/message").at(-1).data.usage).toEqual({ inputTokens: 1, outputTokens: 1 });
 });
 
+test("unadvertised calls are not flushed on failed or interrupted segments", async () => {
+  // 段中断在工具调用后（无 settle 内容）：call 若照落，released 校验报 "no advertised tool lifecycle" 拒整份日志。
+  const scenario = async (signal) => {
+    throwAfterParts = true;
+    const events = [];
+    const agent = makeAgent(events);
+    agent.session.seq = 1;
+    agent.session.eventAt = () => state("claude-code", resumeFrom);
+    parts.splice(0, parts.length, { type: "tool-call", toolCallId: "c1", toolName: "bash", input: { command: "x" } });
+    await expect(runEngineStep(agent, { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }] }, {
+      turn: 1, signal, engine: "claude-code", settings: {}, ctx: { get: () => undefined }, claimStep: () => 1,
+    })).rejects.toThrow("after parts");
+    expect(events.filter((e) => e.type === "tool/call")).toHaveLength(0);
+    assertReleasedLog(events);
+  };
+  await scenario(new AbortController().signal); // failed
+  const aborted = new AbortController();
+  aborted.abort();
+  await scenario(aborted.signal); // interrupted
+});
+
+test("max-tokens segments do not flush calls their message drops", async () => {
+  // BlockAssembler 在 max-tokens 收尾时丢 tool-call 块——call 照落同样 unadvertised。
+  const { events } = await run([
+    { type: "tool-call", toolCallId: "c1", toolName: "bash", input: { command: "x" } },
+    { type: "tool-result", toolCallId: "c1", providerExecuted: true, output: "y" },
+    { type: "finish-step", finishReason: "length" },
+    { type: "finish", finishReason: "length" },
+  ]);
+  expect(events.filter((e) => e.type === "tool/call")).toHaveLength(0);
+  // 块被 assembler 丢光后 settle 成 assistant/attempt 空壳——没有任何 message 能 advertise 这些 call。
+  expect(events.find((e) => e.type === "assistant/message")).toBeUndefined();
+});
+
 test("segment end backfills unresolved calls; a late real result is dropped", async () => {
   const { events } = await run([
     { type: "tool-call", toolCallId: "c1", toolName: "bash", input: { command: "x" } },

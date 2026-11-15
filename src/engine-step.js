@@ -308,7 +308,12 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     } else if (!attempt.ended) {
       attempt.settle("assistant/attempt", () => session.append("assistant/attempt", { turn, step: attempt.step, stream: attempt.stream }).seq);
     }
+    // 只落 settled content 里 advertise 过的工具：failed 段 content 为空、interrupted 的 interruptedBlocks()
+    // 和 max-tokens 的 blocks() 都会丢 tool-call 块——没有块的 call 落成 tool/call 会让 released 校验报
+    // "no advertised tool lifecycle"（整份日志不可 restore）。丢弃的 call 痕迹仍在 stream 的 tool-call-delta 帧里。
+    const advertised = new Set(content.filter((block) => block.type === "tool-call").map((block) => block.id));
     for (const event of segEvents) {
+      if (!advertised.has(event.callId)) continue;
       if (event.kind === "call") dispatchToolCall(event.callId, event.name, event.args);
       else commitToolResult(event.callId, event.text, event.isError);
     }
