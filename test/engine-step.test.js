@@ -121,6 +121,30 @@ test("engine state is scoped by engine; no resumeFrom means fresh with history",
   expect(resumed.call.input).toBe("hi");
 });
 
+test("fallback history replays only real user speech and marks reasoning", async () => {
+  // allowlist：非真人 producer 的 user 消息不冒充「用户：」发言；reasoning 是思考不是发言。
+  calls.length = 0;
+  creates.length = 0;
+  const events = [];
+  const agent = makeAgent(events);
+  agent.session.seq = 2;
+  agent.session.eventAt = () => state("claude-code");
+  agent.session.deriveMessages = () => [
+    { id: "ctx", role: "user", source: { kind: "runtime-context" }, content: [{ type: "text", text: "INJECTED POLICY" }] },
+    { id: "real", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "hi there" }] },
+    { id: "bot", role: "assistant", content: [{ type: "reasoning", text: "secret thoughts" }, { type: "text", text: "the answer" }] },
+  ];
+  parts.splice(0, parts.length, { type: "finish", finishReason: "stop" });
+  await runEngineStep(agent, { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "new" }] }] }, {
+    turn: 1, signal: new AbortController().signal, engine: "claude-code", settings: {}, ctx: { get: () => undefined }, claimStep: () => 1,
+  });
+  const input = calls.at(-1).input;
+  expect(input).not.toContain("INJECTED POLICY");
+  expect(input).toContain("用户：hi there");
+  expect(input).toContain("你：（思考）secret thoughts");
+  expect(input).toContain("the answer");
+});
+
 test("a failed createSession resume retries once without resumeFrom", async () => {
   failResume = true;
   const attempted = await runAs("claude-code", [state("claude-code", resumeFrom)]);

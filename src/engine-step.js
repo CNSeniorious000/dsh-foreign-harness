@@ -16,14 +16,16 @@ import { engineCliId } from "./archive-sync.js";
 /** 引擎会话的持久化记录：harness 的 resume state 交给 dsh 的 plugin record 通道（fork/resume 都携带）。 */
 const STATE_RECORD = "plugin:dsh-foreign-harness/state";
 
-/** 只把用户自己说的话喂给引擎；图片/文件按 dsh 的文本投影惯例变成确定性 handle 文本。 */
+/** 图片/文件按 dsh 的文本投影惯例变成确定性 handle 文本（prompt 与历史重放共用同一投影）。 */
+const partOf = (block) => {
+  if (block.type === "text") return block.text;
+  if (block.type === "image") return textOnlyImageText(block.attachment);
+  if (block.type === "file") return fileHandleText(block.attachment, undefined);
+  return "";
+};
+
+/** 只把用户自己说的话喂给引擎。 */
 function promptOf(messages) {
-  const partOf = (block) => {
-    if (block.type === "text") return block.text;
-    if (block.type === "image") return textOnlyImageText(block.attachment);
-    if (block.type === "file") return fileHandleText(block.attachment, undefined);
-    return "";
-  };
   return messages
     .filter((message) => message.source?.kind === "user")
     .map((message) => (message.content ?? []).map(partOf).join("\n"))
@@ -32,7 +34,8 @@ function promptOf(messages) {
 }
 
 /** 引擎会话接不回来时（resume state 缺失/过期）的兜底：把已落日志的对话拼成上下文前缀。
- * 只取人和引擎真正说过的话：dsh 的 runtime/time context 是给自家 loop 的（文件策略、审批提示、GUI 地址之类），进引擎只会污染判断。
+ * 只取人和引擎真正说过的话：用户消息是 allowlist（只放真人 source）——其余 producer（runtime/time context、
+ * 系统注入）冒充「用户：」发言会污染引擎判断。图片/文件按与 prompt 相同的 handle 投影保留痕迹。
  * @param {object} session @param {Set<string>} excludeIds 本轮刚落的消息不算「此前」
  */
 function historyTextOf(session, excludeIds) {
@@ -40,8 +43,11 @@ function historyTextOf(session, excludeIds) {
   for (const message of session.deriveMessages()) {
     if (excludeIds.has(message.id)) continue;
     if (message.role !== "user" && message.role !== "assistant") continue;
-    if (message.source?.kind === "runtime-context" || message.source?.kind === "time-context") continue;
-    const text = (message.content ?? []).filter((block) => block.type === "text" || block.type === "reasoning").map((block) => block.text).join("\n").trim();
+    if (message.role === "user" && message.source?.kind !== "user") continue;
+    const text = (message.content ?? [])
+      .map((block) => (block.type === "reasoning" ? `（思考）${block.text}` : block.type === "text" ? block.text : partOf(block)))
+      .join("\n")
+      .trim();
     if (text !== "") parts.push(`${message.role === "user" ? "用户" : "你"}：${text}`);
   }
   return parts.join("\n\n");
