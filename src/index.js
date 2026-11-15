@@ -40,6 +40,14 @@ export function guardEngineStepBoundaries(agent) {
   };
 }
 
+/** 段号账本：loop 的 phase.step 是「最后分配的号」（每次 step() 取 phase.step+1 写回）。壳边界被过滤不落盘，
+ * 所以第一段复用壳号、之后每段递增——落盘的号与 loop 的下次分配才能接成 turn 内稠密 1..n（released 校验的硬要求）。
+ * 多消耗号（旧的 phase.step++）会让下一 step() 跳号，restoreReleasedV4Artifact 直接拒整份日志。 */
+export function makeStepClaimer(phase) {
+  let claimed = 0;
+  return () => (phase.step += claimed++ === 0 ? 0 : 1);
+}
+
 /** 把一个 stock agent 的 step() 换成引擎路由；handle.dispose 时顺带停引擎会话。 */
 function patchAgent(serviceCtx, ownerCtx, handle, settingsOf) {
   const agent = handle.agent;
@@ -50,7 +58,7 @@ function patchAgent(serviceCtx, ownerCtx, handle, settingsOf) {
     if (engine === undefined) return stockStep(decision);
     const signal = this.phase.abort.signal;
     // 设置项是 volatile 活配置：每 step 现读，别在创建时冻进闭包。toolSet 由 stock turn() 的 finally dispose。
-    return await runEngineStep(this, decision, { turn: this.phase.turn, signal, engine, settings: settingsOf(), ctx: serviceCtx, claimStep: () => this.phase.step++ });
+    return await runEngineStep(this, decision, { turn: this.phase.turn, signal, engine, settings: settingsOf(), ctx: serviceCtx, claimStep: makeStepClaimer(this.phase) });
   };
   const dispose = async () => {
     await disposeEngineSession(agent).catch(() => {});

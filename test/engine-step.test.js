@@ -31,7 +31,7 @@ mock.module("../src/harness.js", () => ({
 }));
 // mock.module 要先于被测模块加载（import 声明会提升），故动态 import。
 const { runEngineStep } = await import("../src/engine-step.js");
-const { guardEngineStepBoundaries, engineOfSession } = await import("../src/index.js");
+const { guardEngineStepBoundaries, engineOfSession, makeStepClaimer } = await import("../src/index.js");
 
 const makeAgent = (events) => ({
   session: {
@@ -384,6 +384,26 @@ test("engine step shells are dropped; marked segment boundaries pass", () => {
   guardEngineStepBoundaries(stock);
   stock.session.append("step/start", { turn: 1, step: 1 });
   expect(appended.map((event) => event.type)).toEqual(["step/start", "step/start"]);
+});
+
+test("step claimer stays dense across loop step allocations", () => {
+  // 模拟 loop 的账本：每次 step() 取 phase.step+1 写回（壳号，不落盘），段 claim 首次复用、后续递增。
+  const phase = { step: 0 };
+  phase.step = phase.step + 1; // loop 分配 #1
+  const claim1 = makeStepClaimer(phase);
+  expect(claim1()).toBe(1);
+  expect(claim1()).toBe(2);
+  phase.step = phase.step + 1; // loop 分配 #2 → 必须是 3
+  expect(phase.step).toBe(3);
+  const claim2 = makeStepClaimer(phase);
+  expect(claim2()).toBe(3);
+  expect(claim2()).toBe(4);
+});
+
+test("a zero-output turn still claims its step number as an empty pair", async () => {
+  // 只发控制部件的回合也要占号落空对——丢号会让 loop 的下次分配在日志里跳号（restore 拒整份日志）。
+  const { events } = await run([{ type: "finish", finishReason: "stop" }]);
+  expect(events.map((e) => e.type)).toEqual(["user/message", "step/start", "step/end"]);
 });
 
 test("engineOfSession picks up preset switches incrementally", async () => {

@@ -271,6 +271,15 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   /** 已调用但没回报的补一个终止结果，否则卡片永远停在「运行中」。段尾必须补：step/end 的 closeTools 拒绝未决 call；
    * 跨段真结果在 dsh 日志里不可表示（tool/result 只能落在自己的 open step），迟到的真结果由 reported 守卫丢弃。 */
   const backfillMissingResults = () => { for (const callId of callSeqs.keys()) commitToolResult(callId, "(no result)", true); };
+  /** 零产出回合（只发了控制部件，或整轮异常且无产出）也要占号落一个空 step 对——壳被过滤后号若不用掉，
+   * loop 的下次分配在日志里就是跳号（step/start 必须稠密接上）。 */
+  const fillEmptyStep = () => {
+    if (produced) return;
+    const step = claimStep();
+    appendSegmentBoundary("step/start", step);
+    appendSegmentBoundary("step/end", step);
+    produced = true;
+  };
 
   // 流翻译的块索引账本（per attempt，段切换时重置）：harness 的部件 id → dsh 的块序号与缓冲。
   let index = 0;
@@ -453,6 +462,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     const aborted = signal.aborted;
     if (attempt !== null && !attempt.ended) finishSegment({ reason: finishKindOf(aborted ? "abort" : "error"), usage: finishUsage, mode: aborted ? "interrupted" : "failed" });
     backfillMissingResults();
+    fillEmptyStep();
     throw error;
   } finally {
     await rememberEngineState(ctx, agent, engine, engineSession, route.llm, cliIdHint);
@@ -461,6 +471,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   // 引擎没有 finish-step 收尾的尾巴（例如最后只发 finish 部件）也要落盘收口。
   if (attempt !== null && !attempt.ended) finishSegment({ reason: finishReason, usage: finishUsage ?? (resultUsage === undefined ? undefined : normalizeUsage(resultUsage)) });
   backfillMissingResults();
+  fillEmptyStep();
 
   return finishReason.kind === "max-tokens" ? { kind: "max-tokens" } : { kind: "completed" };
 }
