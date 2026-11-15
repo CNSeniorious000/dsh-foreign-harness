@@ -18,13 +18,13 @@ const CODEX_ARCHIVED_DIR = join(homedir(), ".codex", "archived_sessions");
 
 const exec = (file, args) => new Promise((ok) => execFile(file, args, { timeout: 15_000 }, (error) => ok(error === null)));
 
-/** 给一对会话算该往哪边推（一致或基线建立中都返回 undefined）。 */
+/** 给一对会话算该往哪边推（一致或基线建立中都返回 undefined）；target = 对侧要达到的归档态。 */
 export function syncPlan(prevDsh, prevCodex, dsh, codex) {
   if (prevDsh === undefined || prevCodex === undefined) return undefined;
   if (prevDsh === dsh && prevCodex === codex) return undefined;
   if (prevDsh !== dsh && prevCodex !== codex) return undefined;
-  if (prevDsh !== dsh) return dsh ? "archive-codex" : "unarchive-codex";
-  return codex ? "archive-dsh" : "unarchive-dsh";
+  if (prevDsh !== dsh) return { side: "codex", target: dsh };
+  return { side: "dsh", target: codex };
 }
 
 const ROLLOUT_THREAD = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(\.zst)?$/;
@@ -107,6 +107,8 @@ export function startArchiveSync(ctx) {
   const later = (job) => (chain = chain.then(job, job));
 
   /** 批量对齐：pairs = [[threadId, dshId], ...]，单侧变化往另一侧推。 */
+  const retryTimers = new Set();
+  const retryCounts = new Map();
   const reconcile = (pairs) => later(async () => {
     const truth = await archivedThreadIds();
     const dshNow = new Set(registry.archivedSessionIds.map(String));
@@ -115,22 +117,33 @@ export function startArchiveSync(ctx) {
       const dsh = dshNow.has(dshId);
       const last = prev.get(threadId) ?? {};
       const plan = syncPlan(last.dsh, last.codex, dsh, codex);
-      // 推送成功就记目标值（= 对侧现值，可能本来就已到位，不能用 !x 猜翻转）；失败不写基线，延迟重试。
-      // 对侧已到位就直接算成功——codex 的 archive/unarchive 非幂等（对已到位状态报错），打了反而把状态卡死。
-      const target = { "archive-codex": true, "unarchive-codex": false, "archive-dsh": true, "unarchive-dsh": false }[plan];
+      // 推送成功就记目标值；对侧已到位就直接算成功——codex 的 archive/unarchive 非幂等（对已到位状态报错），打了反而把状态卡死。
       let wroteDsh = false;
       let wroteCodex = false;
-      if (plan === "archive-codex" || plan === "unarchive-codex") wroteCodex = codex === target || (await exec("codex", [target ? "archive" : "unarchive", threadId]));
-      if (plan === "archive-dsh" || plan === "unarchive-dsh") wroteDsh = dsh === target || (plan === "archive-dsh" ? await registry.archiveSession(dshId, { stopActivity: true }).then(() => true, () => false) : await registry.unarchiveSession(dshId).then(() => true, () => false));
+      if (plan?.side === "codex") wroteCodex = codex === plan.target || (await exec("codex", [plan.target ? "archive" : "unarchive", threadId]));
+      if (plan?.side === "dsh") wroteDsh = dsh === plan.target || (plan.target ? await registry.archiveSession(dshId, { stopActivity: true }).then(() => true, () => false) : await registry.unarchiveSession(dshId).then(() => true, () => false));
       if (plan !== undefined && !wroteDsh && !wroteCodex) {
         // transient 失败（bridge 持 rollout 时 codex 报 active writer）没有自然的下一次事件会触发它。
-        ctx.logger.warn(`foreign-harness: archive sync ${plan} failed for ${threadId} / ${dshId}, retrying in 30s`);
-        setTimeout(() => queue(threadId), 30_000);
+        ctx.logger.warn(`foreign-harness: archive sync ${plan.side}→${plan.target} failed for ${threadId} / ${dshId}, scheduling retry`);
+        scheduleRetry([threadId, dshId]);
         continue;
       }
-      prev.set(threadId, { dsh: wroteDsh ? codex : dsh, codex: wroteCodex ? dsh : codex });
+      retryCounts.delete(threadId);
+      prev.set(threadId, {
+        dsh: plan?.side === "dsh" && wroteDsh ? plan.target : dsh,
+        codex: plan?.side === "codex" && wroteCodex ? plan.target : codex,
+      });
     }
   });
+  // 失败重试：teardown 清得掉、每对有上限（永久失败不无限打转），带上现成 pair（不过 queue 全量反查）。
+  const scheduleRetry = (pair) => {
+    const [threadId] = pair;
+    const attempt = (retryCounts.get(threadId) ?? 0) + 1;
+    retryCounts.set(threadId, attempt);
+    if (attempt > 5) { ctx.logger.warn(`foreign-harness: archive sync gave up on ${threadId} after ${attempt} attempts`); return; }
+    const timer = setTimeout(() => { retryTimers.delete(timer); void reconcile([pair]); }, 30_000);
+    retryTimers.add(timer);
+  };
 
   // Codex → dsh：rollout 文件搬进/搬出 archived_sessions。一次搬家会来两个 rename 事件，攒 100ms 批处理。
   const pending = new Set();
@@ -173,5 +186,5 @@ export function startArchiveSync(ctx) {
     }
   });
 
-  return () => { off?.(); clearTimeout(flushTimer); watcher?.close(); };
+  return () => { off?.(); clearTimeout(flushTimer); for (const timer of retryTimers) clearTimeout(timer); watcher?.close(); };
 }

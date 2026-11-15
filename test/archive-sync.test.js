@@ -14,13 +14,13 @@ describe("syncPlan", () => {
   });
 
   test("dsh-side move pushes to codex", () => {
-    expect(syncPlan(false, false, true, false)).toBe("archive-codex");
-    expect(syncPlan(true, true, false, true)).toBe("unarchive-codex");
+    expect(syncPlan(false, false, true, false)).toEqual({ side: "codex", target: true });
+    expect(syncPlan(true, true, false, true)).toEqual({ side: "codex", target: false });
   });
 
   test("codex-side move pushes to dsh", () => {
-    expect(syncPlan(false, false, false, true)).toBe("archive-dsh");
-    expect(syncPlan(true, true, true, false)).toBe("unarchive-dsh");
+    expect(syncPlan(false, false, false, true)).toEqual({ side: "dsh", target: true });
+    expect(syncPlan(true, true, true, false)).toEqual({ side: "dsh", target: false });
   });
 
   test("both sides moved in the same tick: no double push", () => {
