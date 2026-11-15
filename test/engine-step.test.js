@@ -244,13 +244,13 @@ test("empty-reasoning blocks are dropped and usage lands flat", async () => {
     { type: "text-start", id: "t1" },
     { type: "text-delta", id: "t1", text: "answer" },
     { type: "text-end", id: "t1" },
-    { type: "finish-step", usage: { inputTokens: { total: 5, cacheRead: 2 }, outputTokens: { total: 6 } }, finishReason: "stop" },
+    { type: "finish-step", usage: { inputTokens: { total: 5, noCache: 3, cacheRead: 2 }, outputTokens: { total: 6 } }, finishReason: "stop" },
     { type: "finish", finishReason: "stop" },
   ]);
   const message = events.find((e) => e.type === "assistant/message");
   expect(message.data.message.content.map((b) => b.type)).toEqual(["text"]);
-  // 嵌套 usage 摊平成数字（codex adapter 的形状）。
-  expect(message.data.usage).toEqual({ inputTokens: 5, outputTokens: 6, cacheReadTokens: 2, cacheWriteTokens: undefined });
+  // 嵌套 usage 摊平成数字（codex adapter 的形状）；inputTokens 存 uncached（disjoint 契约）。
+  expect(message.data.usage).toEqual({ inputTokens: 3, outputTokens: 6, cacheReadTokens: 2, cacheWriteTokens: undefined });
 });
 
 test("segment end invalidates the block ledger; late deltas for stale ids open a fresh segment", async () => {
@@ -276,11 +276,21 @@ test("mixed usage shapes flatten per field", async () => {
     { type: "text-start", id: "t1" },
     { type: "text-delta", id: "t1", text: "a" },
     { type: "text-end", id: "t1" },
-    { type: "finish-step", usage: { inputTokens: { total: 5, cacheRead: 2 }, outputTokens: 6 }, finishReason: "stop" },
+    { type: "finish-step", usage: { inputTokens: { total: 5, noCache: 3, cacheRead: 2 }, outputTokens: 6 }, finishReason: "stop" },
     { type: "finish", finishReason: "stop" },
   ]);
   const message = events.find((e) => e.type === "assistant/message");
-  expect(message.data.usage).toEqual({ inputTokens: 5, outputTokens: 6, cacheReadTokens: 2 });
+  expect(message.data.usage).toEqual({ inputTokens: 3, outputTokens: 6, cacheReadTokens: 2 });
+
+  // claude 的平铺形状同理：inputTokens 是 inclusive 总数，要按 noCacheTokens 减成 uncached。
+  const flat = await run([
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "a" },
+    { type: "text-end", id: "t1" },
+    { type: "finish-step", usage: { inputTokens: 10, outputTokens: 2, inputTokenDetails: { noCacheTokens: 7, cacheReadTokens: 3 } }, finishReason: "stop" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  expect(flat.events.find((e) => e.type === "assistant/message").data.usage).toEqual({ inputTokens: 7, outputTokens: 2, cacheReadTokens: 3 });
 });
 
 test("finish.totalUsage and the turn result seed usage when finish-step carries none", async () => {

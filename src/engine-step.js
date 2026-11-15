@@ -172,13 +172,14 @@ function stripShellWrapper(args) {
 }
 
 // usage 两代形状都要认：平铺（inputTokens: number + inputTokenDetails）与嵌套
-// （inputTokens: {total, cacheRead, cacheWrite}）——codex adapter 发的是后者，不摊平会把
-// 整个对象当 token 数存进 durable message（UI 读数直接坏）。
+// （inputTokens: {total, noCache, cacheRead, cacheWrite}）——不摊平会把整个对象当 token 数存进 durable message。
+// dsh 的计数是 disjoint 契约（types.d.ts：inputTokens = 未缓存部分，billed = 三者之和）：
+// 两代形状的 input 都是 cache-inclusive 总数，必须减成 uncached，否则有 cache 的轮次双计。
 const normalizeUsage = (raw) => {
   const nested = typeof raw.inputTokens === "object" && raw.inputTokens !== null;
   const outputNested = typeof raw.outputTokens === "object" && raw.outputTokens !== null;
   return defined({
-    inputTokens: (nested ? raw.inputTokens.total : raw.inputTokens) ?? 0,
+    inputTokens: nested ? raw.inputTokens.noCache ?? raw.inputTokens.total : raw.inputTokenDetails?.noCacheTokens ?? raw.inputTokens,
     outputTokens: (outputNested ? raw.outputTokens.total : raw.outputTokens) ?? 0,
     totalTokens: raw.totalTokens,
     cacheReadTokens: nested ? raw.inputTokens?.cacheRead : raw.inputTokenDetails?.cacheReadTokens,
