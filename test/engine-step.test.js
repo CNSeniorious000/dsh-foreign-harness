@@ -22,6 +22,7 @@ mock.module("../src/harness.js", () => ({
         if (failTurns > 0) { failTurns--; throw new Error("stale turn"); }
         for (const part of parts) onEvent(part);
         if (throwAfterParts) { throwAfterParts = false; throw new Error("after parts"); }
+        return { text: "ok", usage: { inputTokens: 1, outputTokens: 1 } };
       },
       destroy: async () => {},
       stop: async () => {},
@@ -280,6 +281,26 @@ test("mixed usage shapes flatten per field", async () => {
   ]);
   const message = events.find((e) => e.type === "assistant/message");
   expect(message.data.usage).toEqual({ inputTokens: 5, outputTokens: 6, cacheReadTokens: 2 });
+});
+
+test("finish.totalUsage and the turn result seed usage when finish-step carries none", async () => {
+  // wire 上 finish 带 totalUsage（不叫 usage）；codex 的 finish-step usage 恒零，尾段只能靠这两个来源。
+  const { events } = await run([
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "a" },
+    { type: "text-end", id: "t1" },
+    { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 7, outputTokens: 2 } },
+  ]);
+  expect(events.find((e) => e.type === "assistant/message").data.usage).toEqual({ inputTokens: 7, outputTokens: 2 });
+
+  // finish 部件也没有 usage 时，纯尾段（无 finish-step）退回 turn() 的结果级 usage。
+  const tail = await run([
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "a" },
+    { type: "text-end", id: "t1" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  expect(tail.events.filter((e) => e.type === "assistant/message").at(-1).data.usage).toEqual({ inputTokens: 1, outputTokens: 1 });
 });
 
 test("segment end backfills unresolved calls; a late real result is dropped", async () => {

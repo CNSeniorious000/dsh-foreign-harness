@@ -402,19 +402,25 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       bufferSegEvent({ kind: "result", callId: part.toolCallId, text: String(error?.message ?? error ?? "engine reported a tool error without details").slice(0, 8000), isError: true });
     }
     if (part.type === "finish-step" && attempt !== null) {
-      finishSegment({ reason: finishKindOf(part.finishReason), usage: part.usage === undefined ? undefined : normalizeUsage(part.usage) });
+      const rawUsage = part.usage ?? part.totalUsage;
+      finishSegment({ reason: finishKindOf(part.finishReason), usage: rawUsage === undefined ? undefined : normalizeUsage(rawUsage) });
     }
     if (part.type === "finish") {
       finishReason = finishKindOf(part.finishReason);
-      if (part.usage !== undefined) finishUsage = normalizeUsage(part.usage);
+      // wire 上 finish 带的是 totalUsage（finish-step 才叫 usage）——codex 的 finish-step usage 恒零，这里是唯一的真来源。
+      const rawUsage = part.totalUsage ?? part.usage;
+      if (rawUsage !== undefined) finishUsage = normalizeUsage(rawUsage);
       // 引擎侧会话 id 官方就挂在 finish 部件的 providerMetadata（harness 透传 harnessMetadata）上。
       cliIdHint ??= part.providerMetadata?.["claude-code"]?.sessionId ?? part.providerMetadata?.codex?.threadId;
     }
   };
 
+  /** turn() 结果级 usage：finish 部件缺席时（尾段无 finish）的兜底来源。 */
+  let resultUsage;
   const runTurn = async () => {
     try {
-      await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
+      const result = await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
+      resultUsage = result.usage;
       engineSession.fresh = false;
     } catch (error) {
       // 零产出 + 非中断 = 疑似引擎会话级失效（stale resume）：换 fresh 会话重喂一次。已有任何落盘产出（含纯文本段）就不重试——重跑会重复回答，且 inputOf() 会把已 settle 的回答当此前对话喂回去。
@@ -426,6 +432,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       cliIdHint = undefined;
       finishReason = { kind: "stop" };
       finishUsage = undefined;
+      resultUsage = undefined;
       engineSession = await engineSessionOf(agent, engine, settings, route.authEnv, route.model, { ignoreState: true, sessionId });
       input = inputOf();
       await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
@@ -446,7 +453,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   }
 
   // 引擎没有 finish-step 收尾的尾巴（例如最后只发 finish 部件）也要落盘收口。
-  if (attempt !== null && !attempt.ended) finishSegment({ reason: finishReason, usage: finishUsage });
+  if (attempt !== null && !attempt.ended) finishSegment({ reason: finishReason, usage: finishUsage ?? (resultUsage === undefined ? undefined : normalizeUsage(resultUsage)) });
   backfillMissingResults();
 
   return finishReason.kind === "max-tokens" ? { kind: "max-tokens" } : { kind: "completed" };
