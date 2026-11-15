@@ -45,7 +45,7 @@ function historyTextOf(session, excludeIds) {
     if (message.role !== "user" && message.role !== "assistant") continue;
     if (message.role === "user" && message.source?.kind !== "user") continue;
     const text = (message.content ?? [])
-      .map((block) => (block.type === "reasoning" ? `（思考）${block.text}` : block.type === "text" ? block.text : partOf(block)))
+      .map((block) => (block.type === "reasoning" ? `（思考）${block.text}` : partOf(block)))
       .join("\n")
       .trim();
     if (text !== "") parts.push(`${message.role === "user" ? "用户" : "你"}：${text}`);
@@ -66,10 +66,6 @@ function lastStateOf(session, engine) {
  * CLI 进程的 env 在 spawn 时冻结，配置变了必须换会话（走 resumeFrom 续聊），否则改 key/gateway 静默不生效。 */
 async function engineSessionOf(agent, engine, settings, authEnv, model, { ignoreState = false, sessionId } = {}) {
   const cached = agent.foreignEngineSession;
-  // 指纹覆盖所有 spawn 时冻结进 sandbox/adapter 的配置：CLI 进程 env、cwd 都不会热更。
-  const fingerprint = JSON.stringify(defined({ authEnv, model, stripAnthropic: settings.stripAnthropicEnv, cwd: agent.session.header?.cwd ?? process.cwd() }));
-  if (cached?.engine === engine && cached.fingerprint === fingerprint) return cached;
-  if (cached !== undefined) { await cached.handle.destroy().catch(() => {}); agent.foreignEngineSession = undefined; }
   const state = ignoreState ? undefined : lastStateOf(agent.session, engine);
   const base = {
     engine,
@@ -79,6 +75,12 @@ async function engineSessionOf(agent, engine, settings, authEnv, model, { ignore
     ...(model === undefined ? {} : { model }),
     sessionId: sessionId ?? state?.sessionId ?? `${agent.session.id}:${engine}`,
   };
+  // 指纹 = 交给 createHarnessSession 的全部 spawn 冻结配置（base 除会话身份外的一切）——派生而非手工列举，
+  // 免得每加一个冻结字段就多一处遗漏（stripAnthropic 就漏过一次）。
+  const { sessionId: _sessionId, ...frozen } = base;
+  const fingerprint = JSON.stringify(frozen);
+  if (cached?.engine === engine && cached.fingerprint === fingerprint) return cached;
+  if (cached !== undefined) { await cached.handle.destroy().catch(() => {}); agent.foreignEngineSession = undefined; }
   let handle;
   try {
     handle = await createHarnessSession({ ...base, ...(state?.resumeFrom === undefined ? {} : { resumeFrom: state.resumeFrom }) });
@@ -128,12 +130,13 @@ export async function disposeEngineSession(agent) {
   await cached.handle.stop();
 }
 
+/** wire 的 finishReason 词汇 → 内部词汇（wire 有 'interrupted'/'content-filter' 没有 'abort'，后者只是 catch 路径的内部值）。 */
+const finishReasonOf = (reason) => (reason === "interrupted" ? "abort" : reason === "content-filter" ? "error" : reason);
 const finishKindOf = (reason) => {
   if (reason === "tool-calls") return { kind: "tool-calls" };
   if (reason === "length") return { kind: "max-tokens" };
-  // wire 词汇是 'interrupted'/'content-filter'（'abort' 只是我们 catch 路径的内部值）；LlmFailure.code 必填。
-  if (reason === "error" || reason === "content-filter") return { kind: "error", failure: { message: `engine reported a ${reason} finish`, code: reason } };
-  if (reason === "abort" || reason === "interrupted") return { kind: "aborted", failure: { message: "engine aborted", code: "aborted" } };
+  if (reason === "error") return { kind: "error", failure: { message: "engine reported an error finish", code: reason } };
+  if (reason === "abort") return { kind: "aborted", failure: { message: "engine aborted", code: "aborted" } };
   return { kind: "stop" };
 };
 
@@ -186,13 +189,23 @@ function stripShellWrapper(args) {
 const normalizeUsage = (raw) => {
   const nested = typeof raw.inputTokens === "object" && raw.inputTokens !== null;
   const outputNested = typeof raw.outputTokens === "object" && raw.outputTokens !== null;
+  const cacheRead = nested ? raw.inputTokens?.cacheRead : raw.inputTokenDetails?.cacheReadTokens;
+  const cacheWrite = nested ? raw.inputTokens?.cacheWrite : raw.inputTokenDetails?.cacheWriteTokens;
+  const uncached = nested ? raw.inputTokens.noCache : raw.inputTokenDetails?.noCacheTokens;
   return defined({
-    inputTokens: nested ? raw.inputTokens.noCache ?? raw.inputTokens.total : raw.inputTokenDetails?.noCacheTokens ?? raw.inputTokens,
+    // noCache 缺失时按差值派生，别把 inclusive 总数当 uncached 存（那是另一种双计）。
+    inputTokens: uncached ?? (nested || raw.inputTokenDetails !== undefined ? (nested ? raw.inputTokens.total : raw.inputTokens) - (cacheRead ?? 0) - (cacheWrite ?? 0) : raw.inputTokens),
     outputTokens: (outputNested ? raw.outputTokens.total : raw.outputTokens) ?? 0,
     totalTokens: raw.totalTokens,
-    cacheReadTokens: nested ? raw.inputTokens?.cacheRead : raw.inputTokenDetails?.cacheReadTokens,
-    cacheWriteTokens: nested ? raw.inputTokens?.cacheWrite : raw.inputTokenDetails?.cacheWriteTokens,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: cacheWrite,
   });
+};
+
+/** wire 上 usage 字段两代名字（finish-step 的 `usage`、finish 的 `totalUsage`）——两者从不共存，单点归一。 */
+const usageOf = (part) => {
+  const raw = part.usage ?? part.totalUsage;
+  return raw === undefined ? undefined : normalizeUsage(raw);
 };
 
 /**
@@ -206,14 +219,15 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   const session = agent.session;
   for (const message of decision.messages) session.append("user/message", message, { surfaceOp: "append" });
 
+  const prompt = promptOf(decision.messages);
+  // prompt 是 allowlist（只放真人 user 消息）：全被过滤 = 没有用户输入，对着历史重放只会答非所问——
+  // 诚实失败，且在 spawn 引擎会话之前就失败。
+  if (prompt === "") throw new Error(`${engine}: nothing to run — this turn has no user content`);
   const route = await engineRoute(ctx, agent, engine, settings);
   let engineSession = await engineSessionOf(agent, engine, settings, route.authEnv, route.model);
-  const prompt = promptOf(decision.messages);
   const priorIds = new Set(decision.messages.map((message) => message.id));
   // 引擎会话全新（接不回原对话）才摊历史兜底；fallback 换会话后要重算，所以做成闭包。
-  // prompt 是 allowlist（只放真人 user 消息）：全被过滤 = 没有用户输入，对着历史重放只会答非所问——诚实失败。
   const inputOf = () => {
-    if (prompt === "") throw new Error(`${engine}: nothing to run — this turn has no user content`);
     const context = engineSession.fresh ? historyTextOf(session, priorIds) : "";
     return context === "" ? prompt : `${context}\n\n（以上是此前的对话记录。下面是用户的新消息。）\n\n${prompt}`;
   };
@@ -286,7 +300,6 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     const step = claimStep();
     appendSegmentBoundary("step/start", step);
     appendSegmentBoundary("step/end", step);
-    produced = true;
   };
 
   // 流翻译的块索引账本（per attempt，段切换时重置）：harness 的部件 id → dsh 的块序号与缓冲。
@@ -425,25 +438,23 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       bufferSegEvent({ kind: "result", callId: part.toolCallId, text: String(error?.message ?? error ?? "engine reported a tool error without details").slice(0, 8000), isError: true });
     }
     if (part.type === "finish-step" && attempt !== null) {
-      const rawUsage = part.usage ?? part.totalUsage;
-      finishSegment({ reason: finishKindOf(part.finishReason), usage: rawUsage === undefined ? undefined : normalizeUsage(rawUsage) });
+      finishSegment({ reason: finishKindOf(finishReasonOf(part.finishReason)), usage: usageOf(part) });
     }
     if (part.type === "finish") {
-      finishReason = finishKindOf(part.finishReason);
-      // wire 上 finish 带的是 totalUsage（finish-step 才叫 usage）——codex 的 finish-step usage 恒零，这里是唯一的真来源。
-      const rawUsage = part.totalUsage ?? part.usage;
-      if (rawUsage !== undefined) finishUsage = normalizeUsage(rawUsage);
+      finishReason = finishKindOf(finishReasonOf(part.finishReason));
+      // codex 的 finish-step usage 恒零，finish.totalUsage（usageOf 归一）是回合唯一的真来源。
+      finishUsage ??= usageOf(part);
       // 引擎侧会话 id 官方就挂在 finish 部件的 providerMetadata（harness 透传 harnessMetadata）上。
       cliIdHint ??= part.providerMetadata?.["claude-code"]?.sessionId ?? part.providerMetadata?.codex?.threadId;
     }
   };
 
-  /** turn() 结果级 usage：finish 部件缺席时（尾段无 finish）的兜底来源。 */
+  /** turn() 结果级 usage（已归一）：finish 部件缺席时（尾段无 finish）的兜底来源。 */
   let resultUsage;
   const runTurn = async () => {
     try {
       const result = await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
-      resultUsage = result.usage;
+      resultUsage = result.usage === undefined ? undefined : normalizeUsage(result.usage);
       engineSession.fresh = false;
     } catch (error) {
       // 零产出 + 非中断 = 疑似引擎会话级失效（stale resume）：换 fresh 会话重喂一次。已有任何落盘产出（含纯文本段）就不重试——重跑会重复回答，且 inputOf() 会把已 settle 的回答当此前对话喂回去。
@@ -477,7 +488,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   }
 
   // 引擎没有 finish-step 收尾的尾巴（例如最后只发 finish 部件）也要落盘收口。
-  if (attempt !== null && !attempt.ended) finishSegment({ reason: finishReason, usage: finishUsage ?? (resultUsage === undefined ? undefined : normalizeUsage(resultUsage)) });
+  if (attempt !== null && !attempt.ended) finishSegment({ reason: finishReason, usage: finishUsage ?? resultUsage });
   backfillMissingResults();
   fillEmptyStep();
 
