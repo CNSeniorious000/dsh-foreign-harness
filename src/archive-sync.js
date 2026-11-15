@@ -115,14 +115,17 @@ export function startArchiveSync(ctx) {
       const dsh = dshNow.has(dshId);
       const last = prev.get(threadId) ?? {};
       const plan = syncPlan(last.dsh, last.codex, dsh, codex);
-      // 推送成功就记目标值（= 对侧现值，可能本来就已到位，不能用 !x 猜翻转）；失败不写基线，下次事件重试。
+      // 推送成功就记目标值（= 对侧现值，可能本来就已到位，不能用 !x 猜翻转）；失败不写基线，延迟重试。
+      // 对侧已到位就直接算成功——codex 的 archive/unarchive 非幂等（对已到位状态报错），打了反而把状态卡死。
+      const target = { "archive-codex": true, "unarchive-codex": false, "archive-dsh": true, "unarchive-dsh": false }[plan];
       let wroteDsh = false;
       let wroteCodex = false;
-      if (plan === "archive-codex" || plan === "unarchive-codex") wroteCodex = await exec("codex", [plan === "archive-codex" ? "archive" : "unarchive", threadId]);
-      if (plan === "archive-dsh") wroteDsh = await registry.archiveSession(dshId, { stopActivity: true }).then(() => true, () => false);
-      if (plan === "unarchive-dsh") wroteDsh = await registry.unarchiveSession(dshId).then(() => true, () => false);
+      if (plan === "archive-codex" || plan === "unarchive-codex") wroteCodex = codex === target || (await exec("codex", [target ? "archive" : "unarchive", threadId]));
+      if (plan === "archive-dsh" || plan === "unarchive-dsh") wroteDsh = dsh === target || (plan === "archive-dsh" ? await registry.archiveSession(dshId, { stopActivity: true }).then(() => true, () => false) : await registry.unarchiveSession(dshId).then(() => true, () => false));
       if (plan !== undefined && !wroteDsh && !wroteCodex) {
-        ctx.logger.warn(`foreign-harness: archive sync ${plan} failed for ${threadId} / ${dshId}, will retry on next change`);
+        // transient 失败（bridge 持 rollout 时 codex 报 active writer）没有自然的下一次事件会触发它。
+        ctx.logger.warn(`foreign-harness: archive sync ${plan} failed for ${threadId} / ${dshId}, retrying in 30s`);
+        setTimeout(() => queue(threadId), 30_000);
         continue;
       }
       prev.set(threadId, { dsh: wroteDsh ? codex : dsh, codex: wroteCodex ? dsh : codex });
