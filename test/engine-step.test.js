@@ -337,6 +337,111 @@ test("finish.totalUsage and the turn result seed usage when finish-step carries 
   expect(tail.events.filter((e) => e.type === "assistant/message").at(-1).data.usage).toEqual({ inputTokens: 1, outputTokens: 1 });
 });
 
+test("zero-usage finish-step defers so finish.totalUsage lands on the tail", async () => {
+  // codex 的 finish-step 恒零（bridge inferredStep）：直接收尾会把 finish 的真 totalUsage 关在门外。
+  const { events } = await run([
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "a" },
+    { type: "text-end", id: "t1" },
+    { type: "finish-step", usage: { inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 0 } }, finishReason: "stop" },
+    { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 7, outputTokens: 2 } },
+  ]);
+  expect(events.find((e) => e.type === "assistant/message").data.usage).toEqual({ inputTokens: 7, outputTokens: 2 });
+});
+
+test("an open tool-input block at settle is not advertised", async () => {
+  // 没等到 tool-call 完成件就收段：块落进消息却没有 tool/call 生命周期，closeTools 拒整份日志。
+  const { events } = await run([
+    { type: "tool-input-start", id: "c1", toolName: "bash" },
+    { type: "tool-input-delta", id: "c1", delta: "{\"command\"" },
+    { type: "finish-step", finishReason: "stop" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  expect(events.filter((e) => e.type === "assistant/message")).toHaveLength(0);
+  expect(events.filter((e) => e.type === "tool/call")).toHaveLength(0);
+});
+
+test("null usage parts degrade to result usage instead of throwing", async () => {
+  const { events } = await run([
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "a" },
+    { type: "text-end", id: "t1" },
+    { type: "finish-step", usage: null, finishReason: "stop" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  expect(events.find((e) => e.type === "assistant/message").data.usage).toEqual({ inputTokens: 1, outputTokens: 1 });
+});
+
+test("a duplicate tool-call completion reuses the first block", async () => {
+  // 两代部件同发（tool-input-available + tool-call）只认第一次：同 id 块重复 advertise，released 校验拒整份日志。
+  const { events } = await run([
+    { type: "tool-input-available", id: "c1", toolName: "bash", input: { command: "x" } },
+    { type: "tool-call", toolCallId: "c1", toolName: "bash", input: { command: "x" } },
+    { type: "tool-result", toolCallId: "c1", providerExecuted: true, output: "y" },
+    { type: "finish-step", finishReason: "tool-calls" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  const message = events.find((e) => e.type === "assistant/message");
+  expect(message.data.message.content.filter((b) => b.type === "tool-call")).toHaveLength(1);
+  expect(events.filter((e) => e.type === "tool/call")).toHaveLength(1);
+});
+
+test("a duplicate completion across a segment boundary is dropped", async () => {
+  // 跨段重复完成件同样只认第一次：第二段不得再 advertise 同 id 块（callSeqs/reported 会吞掉事件，留下悬空 advertise）。
+  const { events } = await run([
+    { type: "tool-input-available", id: "c1", toolName: "bash", input: { command: "x" } },
+    { type: "tool-result", toolCallId: "c1", providerExecuted: true, output: "y" },
+    { type: "finish-step", usage: { inputTokens: 5, outputTokens: 2 }, finishReason: "tool-calls" },
+    { type: "tool-call", toolCallId: "c1", toolName: "bash", input: { command: "x" } },
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "done" },
+    { type: "text-end", id: "t1" },
+    { type: "finish", finishReason: "stop" },
+  ]);
+  expect(events.filter((e) => e.type === "assistant/message")).toHaveLength(2);
+  expect(events.filter((e) => e.type === "tool/call")).toHaveLength(1);
+});
+
+test("a wire-reported interrupted finish lands output then throws like stock", async () => {
+  // stock step 对 error/aborted 收尾先落 assistant/attempt 再抛 LlmError（loop 记 turn/end error）——引擎收尾同样不能静默 completed。
+  parts.splice(0, parts.length,
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "a" },
+    { type: "text-end", id: "t1" },
+    { type: "finish-step", finishReason: "interrupted" },
+    { type: "finish", finishReason: "interrupted" });
+  const events = [];
+  const agent = makeAgent(events);
+  await expect(runEngineStep(agent, { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }] }, {
+    turn: 1, signal: new AbortController().signal, engine: "claude-code", settings: {}, ctx: { get: () => undefined }, claimStep: () => 1,
+  })).rejects.toThrow("engine aborted");
+  const message = events.find((e) => e.type === "assistant/message");
+  expect(message.data.interrupted).toBe(true);
+  expect(message.data.message.content.map((b) => b.type)).toEqual(["text"]);
+  assertReleasedLog(events);
+});
+
+test("the fresh-session retry turn also captures result usage", async () => {
+  // 首回合 stale 失败重跑：重跑回合的 result.usage 是尾段（finish 无 usage）的唯一来源，不能丢。
+  failTurns = 1;
+  calls.length = 0;
+  creates.length = 0;
+  const events = [];
+  const agent = makeAgent(events);
+  agent.session.seq = 1;
+  agent.session.eventAt = () => state("claude-code", resumeFrom);
+  parts.splice(0, parts.length,
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", text: "a" },
+    { type: "text-end", id: "t1" },
+    { type: "finish", finishReason: "stop" });
+  await runEngineStep(agent, { messages: [{ id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] }] }, {
+    turn: 1, signal: new AbortController().signal, engine: "claude-code", settings: {}, ctx: { get: () => undefined }, claimStep: () => 1,
+  });
+  expect(events.find((e) => e.type === "assistant/message").data.usage).toEqual({ inputTokens: 1, outputTokens: 1 });
+  assertReleasedLog(events);
+});
+
 test("unadvertised calls are not flushed on failed or interrupted segments", async () => {
   // 段中断在工具调用后（无 settle 内容）：call 若照落，released 校验报 "no advertised tool lifecycle" 拒整份日志。
   const scenario = async (signal) => {

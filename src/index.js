@@ -45,7 +45,7 @@ export function guardEngineStepBoundaries(agent) {
  * 多消耗号（旧的 phase.step++）会让下一 step() 跳号，restoreReleasedV4Artifact 直接拒整份日志。 */
 export function makeStepClaimer(phase) {
   let claimed = 0;
-  return () => (phase.step += claimed++ === 0 ? 0 : 1);
+  return () => (claimed++ === 0 ? phase.step : ++phase.step);
 }
 
 /** 把一个 stock agent 的 step() 换成引擎路由；handle.dispose 时顺带停引擎会话。 */

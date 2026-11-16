@@ -6,7 +6,7 @@
 // 重建锚点（firstVisibleSeq 是瞬态），工具事件若先落，思考行会被挤到工具卡之后。
 import { appendFileSync } from "node:fs";
 import { split as shlexSplit } from "shlex";
-import { createAssistantMessage, createToolResultMessage, fileHandleText, textOnlyImageText } from "@deepseek-ai/dsh-llm";
+import { LlmError, createAssistantMessage, createToolResultMessage, fileHandleText, textOnlyImageText } from "@deepseek-ai/dsh-llm";
 import { appendPluginRecord, pluginRecordOf } from "@deepseek-ai/dsh-session";
 import { createHarnessSession } from "./harness.js";
 import { EngineStreamAttempt } from "./stream-attempt.js";
@@ -44,10 +44,7 @@ function historyTextOf(session, excludeIds) {
     if (excludeIds.has(message.id)) continue;
     if (message.role !== "user" && message.role !== "assistant") continue;
     if (message.role === "user" && message.source?.kind !== "user") continue;
-    const text = (message.content ?? [])
-      .map((block) => (block.type === "reasoning" ? `（思考）${block.text}` : partOf(block)))
-      .join("\n")
-      .trim();
+    const text = (message.content ?? []).map((block) => (block.type === "reasoning" ? `（思考）${block.text}` : partOf(block))).join("\n").trim();
     if (text !== "") parts.push(`${message.role === "user" ? "用户" : "你"}：${text}`);
   }
   return parts.join("\n\n");
@@ -66,21 +63,20 @@ function lastStateOf(session, engine) {
  * CLI 进程的 env 在 spawn 时冻结，配置变了必须换会话（走 resumeFrom 续聊），否则改 key/gateway 静默不生效。 */
 async function engineSessionOf(agent, engine, settings, authEnv, model, { ignoreState = false, sessionId } = {}) {
   const cached = agent.foreignEngineSession;
-  const state = ignoreState ? undefined : lastStateOf(agent.session, engine);
-  const base = {
+  // 指纹 = 交给 createHarnessSession 的全部 spawn 冻结配置（base 除会话身份外的一切）——派生而非手工列举，
+  // 免得每加一个冻结字段就多一处遗漏（stripAnthropic 就漏过一次）。不含会话身份，缓存命中不用扫状态日志。
+  const frozen = {
     engine,
     cwd: agent.session.header?.cwd ?? process.cwd(),
     settings,
     ...(authEnv === undefined ? {} : { authEnv }),
     ...(model === undefined ? {} : { model }),
-    sessionId: sessionId ?? state?.sessionId ?? `${agent.session.id}:${engine}`,
   };
-  // 指纹 = 交给 createHarnessSession 的全部 spawn 冻结配置（base 除会话身份外的一切）——派生而非手工列举，
-  // 免得每加一个冻结字段就多一处遗漏（stripAnthropic 就漏过一次）。
-  const { sessionId: _sessionId, ...frozen } = base;
   const fingerprint = JSON.stringify(frozen);
   if (cached?.engine === engine && cached.fingerprint === fingerprint) return cached;
   if (cached !== undefined) { await cached.handle.destroy().catch(() => {}); agent.foreignEngineSession = undefined; }
+  const state = ignoreState ? undefined : lastStateOf(agent.session, engine);
+  const base = { ...frozen, sessionId: sessionId ?? state?.sessionId ?? `${agent.session.id}:${engine}` };
   let handle;
   try {
     handle = await createHarnessSession({ ...base, ...(state?.resumeFrom === undefined ? {} : { resumeFrom: state.resumeFrom }) });
@@ -192,9 +188,10 @@ const normalizeUsage = (raw) => {
   const cacheRead = nested ? raw.inputTokens?.cacheRead : raw.inputTokenDetails?.cacheReadTokens;
   const cacheWrite = nested ? raw.inputTokens?.cacheWrite : raw.inputTokenDetails?.cacheWriteTokens;
   const uncached = nested ? raw.inputTokens.noCache : raw.inputTokenDetails?.noCacheTokens;
+  const total = nested ? raw.inputTokens.total : raw.inputTokens;
   return defined({
     // noCache 缺失时按差值派生，别把 inclusive 总数当 uncached 存（那是另一种双计）。
-    inputTokens: uncached ?? (nested || raw.inputTokenDetails !== undefined ? (nested ? raw.inputTokens.total : raw.inputTokens) - (cacheRead ?? 0) - (cacheWrite ?? 0) : raw.inputTokens),
+    inputTokens: uncached ?? (nested || raw.inputTokenDetails !== undefined ? (total ?? 0) - (cacheRead ?? 0) - (cacheWrite ?? 0) : total ?? 0),
     outputTokens: (outputNested ? raw.outputTokens.total : raw.outputTokens) ?? 0,
     totalTokens: raw.totalTokens,
     cacheReadTokens: cacheRead,
@@ -205,8 +202,11 @@ const normalizeUsage = (raw) => {
 /** wire 上 usage 字段两代名字（finish-step 的 `usage`、finish 的 `totalUsage`）——两者从不共存，单点归一。 */
 const usageOf = (part) => {
   const raw = part.usage ?? part.totalUsage;
-  return raw === undefined ? undefined : normalizeUsage(raw);
+  return raw === null || raw === undefined ? undefined : normalizeUsage(raw);
 };
+
+/** 缺/零 usage 的段尾不值得把真 usage 关在门外：codex 的 finish-step 恒零（bridge inferredStep），真数在随后 finish 的 totalUsage 上。 */
+const emptyUsage = (usage) => usage === undefined || [usage.inputTokens, usage.outputTokens, usage.totalTokens, usage.cacheReadTokens, usage.cacheWriteTokens].every((count) => (count ?? 0) === 0);
 
 /**
  * 跑一个引擎回合。返回 {kind:"completed"} | {kind:"max-tokens"}（stock step 的返回契约）；
@@ -242,6 +242,8 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   // start 帧触发 rebaseline）。每个段自带 step/start+step/end 配对。
   /** @type {EngineStreamAttempt | null} 当前段的流 attempt（null = 无活跃段） */
   let attempt = null;
+  /** 段已到边界但收尾推迟（零 usage 的 finish-step）：等 finish 的真 usage 一起落（closePending）。 */
+  let pendingClose = null;
   /** 段内攒下的工具事件（到达序）：tool/call+tool/result 在段消息 settle 之后统一落。 */
   const segEvents = [];
   /** 段边界要穿过 agent.session.append 的 shell 过滤器：标记后 append，落盘后立即复位。 */
@@ -251,6 +253,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   };
   // 段只在产出到达时存在（块或工具事件）——finish/finish-step/start-step/raw 等控制件不会开出空 step。
   const ensureSegment = () => {
+    closePending();
     if (attempt !== null) return;
     // 段号从 loop 的 step 账本上取：第一段复用 loop 刚分配的壳号（壳的 start/end 已被 append 过滤器丢弃），
     // 后续段递增，整条日志是顺序的顶级 step——step 不能嵌套，released 格式校验会拒绝。
@@ -272,6 +275,8 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   /** @type {Map<string, {seq: number, step: number}>} callId → tool/call 事件（tool/result 回指与补果用） */
   const callSeqs = new Map();
   const reported = new Set();
+  /** 已收过完成件的 callId（两代部件同发只认第一次，防同 id 块重复 advertise）。 */
+  const completedCalls = new Set();
   /** 已有段 settle 过盘（哪怕纯文本段）——整轮重试会产生重复产出并把已 settle 的回答当历史喂回去。 */
   let produced = false;
 
@@ -324,11 +329,15 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   };
 
   /** 段收尾：finish 帧 → settle 段消息 → 落工具事件 → step/end 退役 retained 流帧。 */
-  const finishSegment = ({ reason, usage, mode = "normal" }) => {
+  const finishSegment = ({ reason, usage, mode = reason.kind === "aborted" ? "interrupted" : "normal" }) => {
     if (usage !== undefined) attempt.push({ type: "usage", usage });
     attempt.push({ type: "finish", reason });
     // 空文本/空思考块不落（codex 会发 reasoning-start/end 零 delta 的空思考），UI 靠块渲染卡片。
-    const content = (mode === "interrupted" ? attempt.interruptedBlocks() : mode === "failed" ? [] : attempt.blocks()).filter((block) => (block.type !== "text" && block.type !== "reasoning") || block.text.trim() !== "");
+    // 没走完 tool-call 完成件的开口 tool 块也不落：消息 advertise 了却没有 tool/call 生命周期，
+    // closeTools 报 "leaves unresolved tool call" 整份日志不可 restore（痕迹仍在 stream 的 tool-call-delta 帧里）。
+    const content = (mode === "interrupted" ? attempt.interruptedBlocks() : mode === "failed" ? [] : attempt.blocks())
+      .filter((block) => (block.type !== "text" && block.type !== "reasoning") || block.text.trim() !== "")
+      .filter((block) => block.type !== "tool-call" || segEvents.some((event) => event.kind === "call" && event.callId === block.id));
     if (content.length > 0) {
       attempt.settle("assistant/message", () => {
         const seq = session.append("assistant/message", { turn, step: attempt.step, message: createAssistantMessage({ content, source }), stream: attempt.stream, ...(mode === "interrupted" ? { interrupted: true } : {}), ...(usage === undefined ? {} : { usage }) }, { surfaceOp: "append" }).seq;
@@ -354,6 +363,14 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     dbg({ event: "segment/end", turn, step: attempt.step });
     open.clear(); // 块台账只活在本段：留着的话，段尾后迟到的 delta/end 会拿陈旧 entry 打到 null attempt
     attempt = null;
+  };
+  /** 推迟的段尾此刻收尾：零 usage finish-step 等的就是 finish 的真 usage（见 pendingClose）。 */
+  const closePending = (usage) => {
+    if (pendingClose === null) return false;
+    const { reason } = pendingClose;
+    pendingClose = null;
+    finishSegment({ reason, usage });
+    return true;
   };
 
   let cliIdHint;
@@ -401,9 +418,12 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
         attempt.push({ type: "tool-call-delta", index: entry.index, id: entry.toolCallId, name: entry.name, argumentsDelta: delta });
       }
     }
-    // 工具调用完成：新旧两代部件名都要认（harness 两代都发）。
+    // 工具调用完成：新旧两代部件名都要认（harness 两代都发）。同 id 的完成件只认第一次——
+    // 两代部件同发会让块台账再开一个同 id 块，消息重复 advertise，released 校验直接拒整份日志。
     if (part.type === "tool-call" || part.type === "tool-input-available") {
       const toolCallId = part.toolCallId ?? part.id;
+      if (completedCalls.has(toolCallId)) return;
+      completedCalls.add(toolCallId);
       // 剥壳只对 codex：它的 command 是 argv join 回来的 `zsh -lc '...'` 包装，剥掉是还原；
       // 别的引擎的 command 是原文，剥壳就是篡改记录。
       const rawArgs = open.get(toolCallId)?.args || JSON.stringify(part.input ?? {});
@@ -437,8 +457,15 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       const error = part.error ?? part.errorText;
       bufferSegEvent({ kind: "result", callId: part.toolCallId, text: String(error?.message ?? error ?? "engine reported a tool error without details").slice(0, 8000), isError: true });
     }
-    if (part.type === "finish-step" && attempt !== null) {
-      finishSegment({ reason: finishKindOf(finishReasonOf(part.finishReason)), usage: usageOf(part) });
+    if (part.type === "finish-step") {
+      closePending();
+      if (attempt !== null) {
+        const usage = usageOf(part);
+        const reason = finishKindOf(finishReasonOf(part.finishReason));
+        // 零/缺 usage 的段尾推迟收尾（closePending）：顺手清块台账，迟到 delta/end 不得并进旧段。
+        if (emptyUsage(usage)) { pendingClose = { reason }; open.clear(); }
+        else finishSegment({ reason, usage });
+      }
     }
     if (part.type === "finish") {
       finishReason = finishKindOf(finishReasonOf(part.finishReason));
@@ -449,12 +476,11 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     }
   };
 
-  /** turn() 结果级 usage（已归一）：finish 部件缺席时（尾段无 finish）的兜底来源。 */
-  let resultUsage;
   const runTurn = async () => {
     try {
       const result = await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
-      resultUsage = result.usage === undefined ? undefined : normalizeUsage(result.usage);
+      // turn() 结果级 usage 是 finish 部件缺席时（尾段无 finish）的兜底来源；??= 让 finish 的 totalUsage 优先。
+      finishUsage ??= result.usage === undefined ? undefined : normalizeUsage(result.usage);
       engineSession.fresh = false;
     } catch (error) {
       // 零产出 + 非中断 = 疑似引擎会话级失效（stale resume）：换 fresh 会话重喂一次。已有任何落盘产出（含纯文本段）就不重试——重跑会重复回答，且 inputOf() 会把已 settle 的回答当此前对话喂回去。
@@ -466,10 +492,10 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
       cliIdHint = undefined;
       finishReason = { kind: "stop" };
       finishUsage = undefined;
-      resultUsage = undefined;
       engineSession = await engineSessionOf(agent, engine, settings, route.authEnv, route.model, { ignoreState: true, sessionId });
       input = inputOf();
-      await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
+      const retried = await engineSession.handle.turn(input, { signal, model: route.model, onEvent: translate });
+      finishUsage ??= retried.usage === undefined ? undefined : normalizeUsage(retried.usage);
       engineSession.fresh = false;
     }
   };
@@ -479,6 +505,7 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
   } catch (error) {
     // 中断/失败也把可见产出落盘（stock 同款 interrupted），否则界面上这轮凭空消失。
     const aborted = signal.aborted;
+    closePending(finishUsage);
     if (attempt !== null && !attempt.ended) finishSegment({ reason: finishKindOf(aborted ? "abort" : "error"), usage: finishUsage, mode: aborted ? "interrupted" : "failed" });
     backfillMissingResults();
     fillEmptyStep();
@@ -487,10 +514,13 @@ export async function runEngineStep(agent, decision, { turn, signal, engine, set
     await rememberEngineState(ctx, agent, engine, engineSession, route.llm, cliIdHint);
   }
 
-  // 引擎没有 finish-step 收尾的尾巴（例如最后只发 finish 部件）也要落盘收口。
-  if (attempt !== null && !attempt.ended) finishSegment({ reason: finishReason, usage: finishUsage ?? resultUsage });
+  // 引擎没有 finish-step 收尾的尾巴（例如最后只发 finish 部件）也要落盘收口；推迟的段尾在这一刻拿到真 usage。
+  if (!closePending(finishUsage) && attempt !== null && !attempt.ended) finishSegment({ reason: finishReason, usage: finishUsage });
   backfillMissingResults();
   fillEmptyStep();
 
+  // 引擎自报的失败/中断（error/aborted）同 stock step：产出已落盘，以 LlmError 抛给 loop 记 turn/end error——
+  // 静默返回 completed 会让 content-filter/中断的回合在日志里是成功的，failure 也没人看得到。
+  if (finishReason.kind === "error" || finishReason.kind === "aborted") throw new LlmError(finishReason.failure.message, finishReason.failure.code, { cause: finishReason.failure });
   return finishReason.kind === "max-tokens" ? { kind: "max-tokens" } : { kind: "completed" };
 }

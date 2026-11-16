@@ -102,13 +102,13 @@ export function startArchiveSync(ctx) {
   /** @type {Map<string, { dsh: boolean | undefined, codex: boolean | undefined }>} threadId → 两侧上次值 */
   const prev = new Map();
 
-  // 串行链：任何一节抛错都放行下一节，否则一次异常就让同步永久静默死掉。
+  // 串行链：任何一节抛错都放行下一节，否则一次异常就让同步永久静默死掉。catch 兜住 job 自身的抛错——
+  // 尾链节的 rejection 没有下一个 later() 接，安静期会被 Node 当 unhandled rejection 杀进程。
   let chain = Promise.resolve();
-  const later = (job) => (chain = chain.then(job, job));
+  const later = (job) => (chain = chain.then(job, job).catch(() => {}));
 
   /** 批量对齐：pairs = [[threadId, dshId], ...]，单侧变化往另一侧推。 */
-  const retryTimers = new Set();
-  const retryCounts = new Map();
+  const retries = new Map();
   const reconcile = (pairs) => later(async () => {
     const truth = await archivedThreadIds();
     const dshNow = new Set(registry.archivedSessionIds.map(String));
@@ -118,31 +118,29 @@ export function startArchiveSync(ctx) {
       const last = prev.get(threadId) ?? {};
       const plan = syncPlan(last.dsh, last.codex, dsh, codex);
       // 推送成功就记目标值；对侧已到位就直接算成功——codex 的 archive/unarchive 非幂等（对已到位状态报错），打了反而把状态卡死。
-      let wroteDsh = false;
-      let wroteCodex = false;
-      if (plan?.side === "codex") wroteCodex = codex === plan.target || (await exec("codex", [plan.target ? "archive" : "unarchive", threadId]));
-      if (plan?.side === "dsh") wroteDsh = dsh === plan.target || (plan.target ? await registry.archiveSession(dshId, { stopActivity: true }).then(() => true, () => false) : await registry.unarchiveSession(dshId).then(() => true, () => false));
-      if (plan !== undefined && !wroteDsh && !wroteCodex) {
+      let wrote = false;
+      if (plan?.side === "codex") wrote = codex === plan.target || (await exec("codex", [plan.target ? "archive" : "unarchive", threadId]));
+      if (plan?.side === "dsh") wrote = dsh === plan.target || (plan.target ? await registry.archiveSession(dshId, { stopActivity: true }).then(() => true, () => false) : await registry.unarchiveSession(dshId).then(() => true, () => false));
+      if (plan !== undefined && !wrote) {
         // transient 失败（bridge 持 rollout 时 codex 报 active writer）没有自然的下一次事件会触发它。
         ctx.logger.warn(`foreign-harness: archive sync ${plan.side}→${plan.target} failed for ${threadId} / ${dshId}, scheduling retry`);
         scheduleRetry([threadId, dshId]);
         continue;
       }
-      retryCounts.delete(threadId);
-      prev.set(threadId, {
-        dsh: plan?.side === "dsh" && wroteDsh ? plan.target : dsh,
-        codex: plan?.side === "codex" && wroteCodex ? plan.target : codex,
-      });
+      clearTimeout(retries.get(threadId)?.timer); retries.delete(threadId);
+      prev.set(threadId, { dsh: plan?.side === "dsh" && wrote ? plan.target : dsh, codex: plan?.side === "codex" && wrote ? plan.target : codex });
     }
   });
-  // 失败重试：teardown 清得掉、每对有上限（永久失败不无限打转），带上现成 pair（不过 queue 全量反查）。
+  // 失败重试：teardown 清得掉、每段失败串有上限（永久失败不无限打转），带上现成 pair（不过 queue 全量反查）。
+  // 放弃时把预算也清掉：计数留着会让这对从此永久放弃（一次 transient 抖动就永久断掉自动对齐）。
   const scheduleRetry = (pair) => {
     const [threadId] = pair;
-    const attempt = (retryCounts.get(threadId) ?? 0) + 1;
-    retryCounts.set(threadId, attempt);
-    if (attempt > 5) { ctx.logger.warn(`foreign-harness: archive sync gave up on ${threadId} after ${attempt} attempts`); return; }
-    const timer = setTimeout(() => { retryTimers.delete(timer); void reconcile([pair]); }, 30_000);
-    retryTimers.add(timer);
+    const entry = retries.get(threadId) ?? { attempts: 0 };
+    entry.attempts += 1;
+    clearTimeout(entry.timer);
+    if (entry.attempts > 5) { retries.delete(threadId); ctx.logger.warn(`foreign-harness: archive sync gave up on ${threadId} after ${entry.attempts} attempts`); return; }
+    entry.timer = setTimeout(() => void reconcile([pair]), 30_000);
+    retries.set(threadId, entry);
   };
 
   // Codex → dsh：rollout 文件搬进/搬出 archived_sessions。一次搬家会来两个 rename 事件，攒 100ms 批处理。
@@ -186,5 +184,5 @@ export function startArchiveSync(ctx) {
     }
   });
 
-  return () => { off?.(); clearTimeout(flushTimer); for (const timer of retryTimers) clearTimeout(timer); watcher?.close(); };
+  return () => { off?.(); clearTimeout(flushTimer); for (const { timer } of retries.values()) clearTimeout(timer); watcher?.close(); };
 }
